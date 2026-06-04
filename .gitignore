@@ -1,0 +1,21 @@
+# Folders to ignore
+/Dev Org/
+/backend/build/
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.vite/
+/nodejs_backend/node_modules/
+/nodejs_backend/recordings/
+
+# Build artifacts
+*.obj
+*.o
+*.pdb
+*.ilk
+*.suo
+*.user
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
