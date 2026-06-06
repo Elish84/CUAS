@@ -523,6 +523,45 @@ export default function App() {
   // Map location selection
   const [isSelectingLocationFromMap, setIsSelectingLocationFromMap] = useState<boolean>(false);
 
+  // Threat alert management states
+  const [alertThreshold, setAlertThreshold] = useState<number>(() => {
+    const saved = localStorage.getItem('mitzpe_metzoda_alert_threshold');
+    return saved ? parseFloat(saved) : 0.70;
+  });
+  const [activeThreatAlerts, setActiveThreatAlerts] = useState<Detection[]>([]);
+  const [closedThreatAlertIds, setClosedThreatAlertIds] = useState<Set<string>>(new Set());
+  const focusedThreatIdsRef = useRef<Set<string>>(new Set());
+
+  const playAlertSound = useCallback(() => {
+    try {
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const osc = audioCtx.createOscillator();
+      const gainNode = audioCtx.createGain();
+      
+      osc.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
+      
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(800, audioCtx.currentTime);
+      osc.frequency.linearRampToValueAtTime(1200, audioCtx.currentTime + 0.25);
+      osc.frequency.linearRampToValueAtTime(800, audioCtx.currentTime + 0.5);
+      osc.frequency.linearRampToValueAtTime(1200, audioCtx.currentTime + 0.75);
+      osc.frequency.linearRampToValueAtTime(800, audioCtx.currentTime + 1.0);
+      
+      gainNode.gain.setValueAtTime(0.3, audioCtx.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 1.2);
+      
+      osc.start(audioCtx.currentTime);
+      osc.stop(audioCtx.currentTime + 1.2);
+    } catch (err) {
+      console.error('Failed to play alert sound:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem('mitzpe_metzoda_alert_threshold', alertThreshold.toString());
+  }, [alertThreshold]);
+
   useEffect(() => {
     const handleResize = () => {
       setPlaybackPos({
@@ -1492,6 +1531,48 @@ export default function App() {
     return true;
   });
 
+  // Threat alert check loop
+  useEffect(() => {
+    const currentThreats = filteredDetections.filter(d => {
+      const score = defenseZones.length > 0 
+        ? computeThreatScore(d, defenseZones, threatWeights).score
+        : (getClassification(d) === 'drone' ? 1.0 : 0.0);
+      return score >= alertThreshold;
+    });
+
+    currentThreats.forEach(t => {
+      if (!focusedThreatIdsRef.current.has(t.id)) {
+        setSelectedDetection(t);
+        if (mapRef.current) {
+          mapRef.current.flyTo({ center: [t.lng, t.lat], zoom: 15, duration: 1000 });
+        }
+        focusedThreatIdsRef.current.add(t.id);
+        playAlertSound();
+      }
+    });
+
+    const activeIds = new Set(filteredDetections.map(d => d.id));
+    focusedThreatIdsRef.current.forEach(id => {
+      if (!activeIds.has(id)) {
+        focusedThreatIdsRef.current.delete(id);
+      }
+    });
+
+    setActiveThreatAlerts(currentThreats);
+
+    setClosedThreatAlertIds(prev => {
+      const updated = new Set(prev);
+      let changed = false;
+      prev.forEach(id => {
+        if (!activeIds.has(id)) {
+          updated.delete(id);
+          changed = true;
+        }
+      });
+      return changed ? updated : prev;
+    });
+  }, [filteredDetections, defenseZones, threatWeights, alertThreshold, getClassification, playAlertSound]);
+
   const masterPowerActive = radars.some(r => r.isActive);
   const currentSelectedDetection = selectedDetection 
     ? detections.find(d => d.id === selectedDetection.id) || null 
@@ -1759,6 +1840,64 @@ export default function App() {
           </button>
         </div>
       )}
+
+      {/* Active Threat Popups Stack */}
+      <div style={{
+        position: 'absolute',
+        top: '100px',
+        right: '20px',
+        zIndex: 10002,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '10px',
+        width: '320px',
+        pointerEvents: 'none'
+      }}>
+        {activeThreatAlerts.filter(t => !closedThreatAlertIds.has(t.id)).map(threat => {
+          const score = defenseZones.length > 0 
+            ? computeThreatScore(threat, defenseZones, threatWeights).score
+            : (getClassification(threat) === 'drone' ? 1.0 : 0.0);
+          
+          return (
+            <div 
+              key={`alert-popup-${threat.id}`}
+              className="glass-panel pulse-alert-border"
+              style={{
+                pointerEvents: 'auto',
+                background: 'rgba(20, 5, 5, 0.9)',
+                border: '2px solid var(--accent-red)',
+                borderRadius: '8px',
+                padding: '1rem',
+                boxShadow: '0 0 15px rgba(239, 68, 68, 0.4)',
+                color: '#fff',
+                textAlign: lang === 'he' ? 'right' : 'left',
+                direction: lang === 'he' ? 'rtl' : 'ltr'
+              }}
+            >
+              <div className="flex-row" style={{ justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid rgba(239, 68, 68, 0.3)', paddingBottom: '0.5rem', marginBottom: '0.5rem' }}>
+                <div className="flex-row" style={{ alignItems: 'center', gap: '8px' }}>
+                  <span className="blink-dot" style={{ width: '10px', height: '10px', borderRadius: '50%', background: 'var(--accent-red)' }} />
+                  <strong style={{ color: 'var(--accent-red)', fontSize: '0.95rem' }}>
+                    {lang === 'he' ? 'חדירת כלי טיס עוין!' : 'Hostile Aircraft Intrusion!'}
+                  </strong>
+                </div>
+                <button 
+                  onClick={() => setClosedThreatAlertIds(prev => new Set(prev).add(threat.id))} 
+                  style={{ background: 'transparent', border: 'none', color: '#fff', cursor: 'pointer', fontSize: '1.2rem', lineHeight: 1 }}
+                >
+                  &times;
+                </button>
+              </div>
+              <div className="flex-col" style={{ gap: '4px', fontSize: '0.85rem' }}>
+                <div><strong>{lang === 'he' ? 'מזהה מטרה:' : 'Target ID:'}</strong> {threat.id}</div>
+                <div><strong>{lang === 'he' ? 'רמת איום:' : 'Threat Level:'}</strong> <span style={{ color: 'var(--accent-red)', fontWeight: 'bold' }}>{Math.round(score * 100)}%</span></div>
+                <div><strong>{lang === 'he' ? 'גובה מעפ"ש:' : 'AGL Altitude:'}</strong> {getTerrainAgl(threat.lng, threat.lat, threat.alt)}m</div>
+                <div><strong>{lang === 'he' ? 'מהירות:' : 'Speed:'}</strong> {threat.speed.toFixed(1)} m/s</div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
 
       {/* ZONE HEIGHT DIALOG */}
       {showZoneHeightDialog && (
@@ -2733,6 +2872,22 @@ export default function App() {
                   onChange={(e) => setMaxRecordingDuration(Math.max(1, parseInt(e.target.value, 10) || 10))} 
                 />
               </div>
+              <div className="flex-col" style={{ gap: '4px', marginTop: '0.75rem', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '0.75rem' }}>
+                <div className="flex-row" style={{ justifyContent: 'space-between', fontSize: '0.9rem' }}>
+                  <span className="text-muted">
+                    {lang === 'he' ? 'סף התראת איום אווירי:' : 'Aerial Threat Alert Threshold:'}
+                  </span>
+                  <span style={{ color: 'var(--accent-red)', fontWeight: 'bold' }}>
+                    {Math.round(alertThreshold * 100)}%
+                  </span>
+                </div>
+                <input 
+                  type="range" min="0" max="1" step="0.05"
+                  value={alertThreshold} 
+                  onChange={(e) => setAlertThreshold(parseFloat(e.target.value))} 
+                  style={{ accentColor: 'var(--accent-red)', width: '100%' }}
+                />
+              </div>
             </div>
 
             {/* Weights Sliders */}
@@ -3070,6 +3225,22 @@ export default function App() {
         }
         .pulse-red {
           animation: pulse-red 1s infinite;
+        }
+        @keyframes pulse-alert-border {
+          0% { box-shadow: 0 0 8px rgba(239, 68, 68, 0.4); }
+          50% { box-shadow: 0 0 18px rgba(239, 68, 68, 0.8); }
+          100% { box-shadow: 0 0 8px rgba(239, 68, 68, 0.4); }
+        }
+        .pulse-alert-border {
+          animation: pulse-alert-border 1.5s infinite;
+        }
+        @keyframes blink-dot {
+          0% { opacity: 1; }
+          50% { opacity: 0.2; }
+          100% { opacity: 1; }
+        }
+        .blink-dot {
+          animation: blink-dot 0.8s infinite;
         }
       `}</style>
     </div>
