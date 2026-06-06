@@ -528,12 +528,32 @@ export default function App() {
     const saved = localStorage.getItem('mitzpe_metzoda_alert_threshold');
     return saved ? parseFloat(saved) : 0.70;
   });
-  const [activeThreatAlerts, setActiveThreatAlerts] = useState<Detection[]>([]);
+  const [alertSoundType, setAlertSoundType] = useState<'siren' | 'sonar' | 'beeps' | 'warble'>(() => {
+    const saved = localStorage.getItem('mitzpe_metzoda_alert_sound_type');
+    return (saved === 'siren' || saved === 'sonar' || saved === 'beeps' || saved === 'warble') ? saved : 'siren';
+  });
+  const [alertPopupDuration, setAlertPopupDuration] = useState<number>(() => {
+    const saved = localStorage.getItem('mitzpe_metzoda_alert_popup_duration');
+    return saved ? parseInt(saved, 10) : 0; // default 0 (disappear when target disappears)
+  });
+
+  type AlertPopupItem = {
+    id: string;
+    score: number;
+    alt: number;
+    lng: number;
+    lat: number;
+    speed: number;
+    timestamp: number;
+    isOffline?: boolean;
+  };
+  const [alertPopups, setAlertPopups] = useState<AlertPopupItem[]>([]);
   const [closedThreatAlertIds, setClosedThreatAlertIds] = useState<Set<string>>(new Set());
   const focusedThreatIdsRef = useRef<Set<string>>(new Set());
 
-  const playAlertSound = useCallback(() => {
+  const playAlertSound = useCallback((soundTypeOverride?: 'siren' | 'sonar' | 'beeps' | 'warble') => {
     try {
+      const type = soundTypeOverride || alertSoundType;
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       const osc = audioCtx.createOscillator();
       const gainNode = audioCtx.createGain();
@@ -541,26 +561,67 @@ export default function App() {
       osc.connect(gainNode);
       gainNode.connect(audioCtx.destination);
       
-      osc.type = 'sawtooth';
-      osc.frequency.setValueAtTime(800, audioCtx.currentTime);
-      osc.frequency.linearRampToValueAtTime(1200, audioCtx.currentTime + 0.25);
-      osc.frequency.linearRampToValueAtTime(800, audioCtx.currentTime + 0.5);
-      osc.frequency.linearRampToValueAtTime(1200, audioCtx.currentTime + 0.75);
-      osc.frequency.linearRampToValueAtTime(800, audioCtx.currentTime + 1.0);
-      
-      gainNode.gain.setValueAtTime(0.3, audioCtx.currentTime);
-      gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 1.2);
-      
-      osc.start(audioCtx.currentTime);
-      osc.stop(audioCtx.currentTime + 1.2);
+      if (type === 'siren') {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(800, audioCtx.currentTime);
+        osc.frequency.linearRampToValueAtTime(1200, audioCtx.currentTime + 0.25);
+        osc.frequency.linearRampToValueAtTime(800, audioCtx.currentTime + 0.5);
+        osc.frequency.linearRampToValueAtTime(1200, audioCtx.currentTime + 0.75);
+        osc.frequency.linearRampToValueAtTime(800, audioCtx.currentTime + 1.0);
+        gainNode.gain.setValueAtTime(0.3, audioCtx.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 1.2);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 1.2);
+      } else if (type === 'sonar') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(1500, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(1000, audioCtx.currentTime + 0.4);
+        gainNode.gain.setValueAtTime(0.4, audioCtx.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 1.5);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 1.5);
+      } else if (type === 'beeps') {
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(950, audioCtx.currentTime);
+        gainNode.gain.setValueAtTime(0.0, audioCtx.currentTime);
+        gainNode.gain.setValueAtTime(0.25, audioCtx.currentTime + 0.05);
+        gainNode.gain.setValueAtTime(0.0, audioCtx.currentTime + 0.2);
+        gainNode.gain.setValueAtTime(0.25, audioCtx.currentTime + 0.25);
+        gainNode.gain.setValueAtTime(0.0, audioCtx.currentTime + 0.4);
+        gainNode.gain.setValueAtTime(0.25, audioCtx.currentTime + 0.45);
+        gainNode.gain.setValueAtTime(0.0, audioCtx.currentTime + 0.6);
+        gainNode.gain.setValueAtTime(0.25, audioCtx.currentTime + 0.65);
+        gainNode.gain.setValueAtTime(0.0, audioCtx.currentTime + 0.8);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 0.9);
+      } else if (type === 'warble') {
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(900, audioCtx.currentTime);
+        for (let i = 0; i < 10; i++) {
+          const t = i * 0.1;
+          osc.frequency.setValueAtTime(i % 2 === 0 ? 1000 : 700, audioCtx.currentTime + t);
+        }
+        gainNode.gain.setValueAtTime(0.35, audioCtx.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 1.0);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 1.0);
+      }
     } catch (err) {
       console.error('Failed to play alert sound:', err);
     }
-  }, []);
+  }, [alertSoundType]);
 
   useEffect(() => {
     localStorage.setItem('mitzpe_metzoda_alert_threshold', alertThreshold.toString());
   }, [alertThreshold]);
+
+  useEffect(() => {
+    localStorage.setItem('mitzpe_metzoda_alert_sound_type', alertSoundType);
+  }, [alertSoundType]);
+
+  useEffect(() => {
+    localStorage.setItem('mitzpe_metzoda_alert_popup_duration', alertPopupDuration.toString());
+  }, [alertPopupDuration]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -1533,6 +1594,7 @@ export default function App() {
 
   // Threat alert check loop
   useEffect(() => {
+    const activeIds = new Set(filteredDetections.map(d => d.id));
     const currentThreats = filteredDetections.filter(d => {
       const score = defenseZones.length > 0 
         ? computeThreatScore(d, defenseZones, threatWeights).score
@@ -1540,6 +1602,7 @@ export default function App() {
       return score >= alertThreshold;
     });
 
+    // 1. Process new threats (sound & focus)
     currentThreats.forEach(t => {
       if (!focusedThreatIdsRef.current.has(t.id)) {
         setSelectedDetection(t);
@@ -1551,15 +1614,78 @@ export default function App() {
       }
     });
 
-    const activeIds = new Set(filteredDetections.map(d => d.id));
+    // 2. Cleanup focusedThreatIdsRef for targets that disappeared
     focusedThreatIdsRef.current.forEach(id => {
       if (!activeIds.has(id)) {
         focusedThreatIdsRef.current.delete(id);
       }
     });
 
-    setActiveThreatAlerts(currentThreats);
+    // 3. Update alertPopups state
+    setAlertPopups(prev => {
+      const now = Date.now();
+      let updated = [...prev];
 
+      // Update existing popups with live data or mark them offline if target disappeared
+      updated = updated.map(p => {
+        const activeDet = filteredDetections.find(d => d.id === p.id);
+        if (activeDet) {
+          const score = defenseZones.length > 0 
+            ? computeThreatScore(activeDet, defenseZones, threatWeights).score
+            : (getClassification(activeDet) === 'drone' ? 1.0 : 0.0);
+          return {
+            ...p,
+            score,
+            alt: activeDet.alt,
+            lng: activeDet.lng,
+            lat: activeDet.lat,
+            speed: activeDet.speed,
+            isOffline: false
+          };
+        } else {
+          return { ...p, isOffline: true };
+        }
+      });
+
+      // Add new threat alerts if not already in the popup list and not recently closed
+      currentThreats.forEach(t => {
+        if (!updated.some(p => p.id === t.id) && !closedThreatAlertIds.has(t.id)) {
+          const score = defenseZones.length > 0 
+            ? computeThreatScore(t, defenseZones, threatWeights).score
+            : (getClassification(t) === 'drone' ? 1.0 : 0.0);
+          updated.push({
+            id: t.id,
+            score,
+            alt: t.alt,
+            lng: t.lng,
+            lat: t.lat,
+            speed: t.speed,
+            timestamp: now,
+            isOffline: false
+          });
+        }
+      });
+
+      // Filter out popups according to duration setting
+      updated = updated.filter(p => {
+        if (closedThreatAlertIds.has(p.id)) return false;
+
+        if (alertPopupDuration === 0) {
+          return !p.isOffline;
+        }
+
+        if (alertPopupDuration > 0) {
+          const elapsedSeconds = (now - p.timestamp) / 1000;
+          return elapsedSeconds < alertPopupDuration;
+        }
+
+        return true; // if -1, keep forever
+      });
+
+      return updated;
+    });
+
+    // Clean up closed alerts set for targets that disappeared so they can trigger again next time
     setClosedThreatAlertIds(prev => {
       const updated = new Set(prev);
       let changed = false;
@@ -1571,7 +1697,8 @@ export default function App() {
       });
       return changed ? updated : prev;
     });
-  }, [filteredDetections, defenseZones, threatWeights, alertThreshold, getClassification, playAlertSound]);
+
+  }, [filteredDetections, defenseZones, threatWeights, alertThreshold, alertPopupDuration, getClassification, playAlertSound, closedThreatAlertIds]);
 
   const masterPowerActive = radars.some(r => r.isActive);
   const currentSelectedDetection = selectedDetection 
@@ -1853,36 +1980,38 @@ export default function App() {
         width: '320px',
         pointerEvents: 'none'
       }}>
-        {activeThreatAlerts.filter(t => !closedThreatAlertIds.has(t.id)).map(threat => {
-          const score = defenseZones.length > 0 
-            ? computeThreatScore(threat, defenseZones, threatWeights).score
-            : (getClassification(threat) === 'drone' ? 1.0 : 0.0);
-          
+        {alertPopups.map(threat => {
           return (
             <div 
               key={`alert-popup-${threat.id}`}
               className="glass-panel pulse-alert-border"
               style={{
                 pointerEvents: 'auto',
-                background: 'rgba(20, 5, 5, 0.9)',
-                border: '2px solid var(--accent-red)',
+                background: threat.isOffline ? 'rgba(20, 20, 20, 0.9)' : 'rgba(20, 5, 5, 0.9)',
+                border: threat.isOffline ? '2px solid #555' : '2px solid var(--accent-red)',
                 borderRadius: '8px',
                 padding: '1rem',
-                boxShadow: '0 0 15px rgba(239, 68, 68, 0.4)',
+                boxShadow: threat.isOffline ? 'none' : '0 0 15px rgba(239, 68, 68, 0.4)',
                 color: '#fff',
                 textAlign: lang === 'he' ? 'right' : 'left',
                 direction: lang === 'he' ? 'rtl' : 'ltr'
               }}
             >
-              <div className="flex-row" style={{ justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid rgba(239, 68, 68, 0.3)', paddingBottom: '0.5rem', marginBottom: '0.5rem' }}>
+              <div className="flex-row" style={{ justifyContent: 'space-between', alignItems: 'center', borderBottom: threat.isOffline ? '1px solid #555' : '1px solid rgba(239, 68, 68, 0.3)', paddingBottom: '0.5rem', marginBottom: '0.5rem' }}>
                 <div className="flex-row" style={{ alignItems: 'center', gap: '8px' }}>
-                  <span className="blink-dot" style={{ width: '10px', height: '10px', borderRadius: '50%', background: 'var(--accent-red)' }} />
-                  <strong style={{ color: 'var(--accent-red)', fontSize: '0.95rem' }}>
-                    {lang === 'he' ? 'חדירת כלי טיס עוין!' : 'Hostile Aircraft Intrusion!'}
+                  {!threat.isOffline && <span className="blink-dot" style={{ width: '10px', height: '10px', borderRadius: '50%', background: 'var(--accent-red)' }} />}
+                  <strong style={{ color: threat.isOffline ? '#aaa' : 'var(--accent-red)', fontSize: '0.95rem' }}>
+                    {threat.isOffline 
+                      ? (lang === 'he' ? 'איום לא מקוון / אבד קשר' : 'Threat Offline / Connection Lost')
+                      : (lang === 'he' ? 'חדירת כלי טיס עוין!' : 'Hostile Aircraft Intrusion!')}
                   </strong>
                 </div>
                 <button 
-                  onClick={() => setClosedThreatAlertIds(prev => new Set(prev).add(threat.id))} 
+                  onClick={() => setClosedThreatAlertIds(prev => {
+                    const next = new Set(prev);
+                    next.add(threat.id);
+                    return next;
+                  })} 
                   style={{ background: 'transparent', border: 'none', color: '#fff', cursor: 'pointer', fontSize: '1.2rem', lineHeight: 1 }}
                 >
                   &times;
@@ -1890,7 +2019,7 @@ export default function App() {
               </div>
               <div className="flex-col" style={{ gap: '4px', fontSize: '0.85rem' }}>
                 <div><strong>{lang === 'he' ? 'מזהה מטרה:' : 'Target ID:'}</strong> {threat.id}</div>
-                <div><strong>{lang === 'he' ? 'רמת איום:' : 'Threat Level:'}</strong> <span style={{ color: 'var(--accent-red)', fontWeight: 'bold' }}>{Math.round(score * 100)}%</span></div>
+                <div><strong>{lang === 'he' ? 'רמת איום:' : 'Threat Level:'}</strong> <span style={{ color: threat.isOffline ? '#aaa' : 'var(--accent-red)', fontWeight: 'bold' }}>{Math.round(threat.score * 100)}%</span></div>
                 <div><strong>{lang === 'he' ? 'גובה מעפ"ש:' : 'AGL Altitude:'}</strong> {getTerrainAgl(threat.lng, threat.lat, threat.alt)}m</div>
                 <div><strong>{lang === 'he' ? 'מהירות:' : 'Speed:'}</strong> {threat.speed.toFixed(1)} m/s</div>
               </div>
@@ -2887,6 +3016,64 @@ export default function App() {
                   onChange={(e) => setAlertThreshold(parseFloat(e.target.value))} 
                   style={{ accentColor: 'var(--accent-red)', width: '100%' }}
                 />
+              </div>
+              
+              <div className="flex-row" style={{ gap: '1rem', marginTop: '0.75rem', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '0.75rem' }}>
+                <div className="flex-col" style={{ flex: 1, gap: '4px' }}>
+                  <label style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+                    {lang === 'he' ? 'זמן תצוגת פופ-אפ:' : 'Popup Alert Duration:'}
+                  </label>
+                  <select
+                    className="config-input"
+                    value={alertPopupDuration}
+                    onChange={(e) => setAlertPopupDuration(parseInt(e.target.value, 10))}
+                    style={{ background: 'rgba(0,0,0,0.5)', color: '#fff', border: '1px solid rgba(255,255,255,0.2)', padding: '0.3rem', borderRadius: '4px', fontSize: '0.85rem' }}
+                  >
+                    <option value="-1">{lang === 'he' ? 'עד לסגירת החלון ידנית' : 'Until closed manually'}</option>
+                    <option value="0">{lang === 'he' ? 'כשהאיום נעלם מהמכ"ם' : 'When target disappears'}</option>
+                    <option value="5">5 {lang === 'he' ? 'שניות' : 'Seconds'}</option>
+                    <option value="10">10 {lang === 'he' ? 'שניות' : 'Seconds'}</option>
+                    <option value="30">30 {lang === 'he' ? 'שניות' : 'Seconds'}</option>
+                    <option value="60">60 {lang === 'he' ? 'שניות' : 'Seconds'}</option>
+                  </select>
+                </div>
+
+                <div className="flex-col" style={{ flex: 1, gap: '4px' }}>
+                  <label style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+                    {lang === 'he' ? 'סוג צליל התראה:' : 'Alert Sound Type:'}
+                  </label>
+                  <div className="flex-row" style={{ gap: '0.5rem', alignItems: 'center' }}>
+                    <select
+                      className="config-input"
+                      value={alertSoundType}
+                      onChange={(e) => setAlertSoundType(e.target.value as any)}
+                      style={{ flex: 1, background: 'rgba(0,0,0,0.5)', color: '#fff', border: '1px solid rgba(255,255,255,0.2)', padding: '0.3rem', borderRadius: '4px', fontSize: '0.85rem' }}
+                    >
+                      <option value="siren">{lang === 'he' ? 'סירנה עולה ויורדת' : 'Rising Siren'}</option>
+                      <option value="sonar">{lang === 'he' ? 'פינג סונאר' : 'Sonar Ping'}</option>
+                      <option value="beeps">{lang === 'he' ? 'צפצופים מהירים' : 'Urgent Beeps'}</option>
+                      <option value="warble">{lang === 'he' ? 'פולסים מהירים (וורבל)' : 'Warble'}</option>
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => playAlertSound()}
+                      style={{
+                        background: 'var(--accent-cyan)',
+                        color: '#000',
+                        border: 'none',
+                        borderRadius: '4px',
+                        padding: '0.3rem 0.6rem',
+                        cursor: 'pointer',
+                        fontSize: '0.8rem',
+                        fontWeight: 'bold',
+                        whiteSpace: 'nowrap'
+                      }}
+                      title={lang === 'he' ? 'בדיקת צליל' : 'Test sound'}
+                    >
+                      🔊 {lang === 'he' ? 'בדיקה' : 'Test'}
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
 
