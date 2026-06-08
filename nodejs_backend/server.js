@@ -58,6 +58,43 @@ app.get('/api/recordings/download/:filename', (req, res) => {
   res.sendFile(filePath);
 });
 
+// Download a recording file with offline fusion applied inline
+app.get('/api/recordings/download_fused/:filename', (req, res) => {
+  const filename = req.params.filename;
+  const filePath = path.join(recordingsDir, path.basename(filename));
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+
+  const fileContent = fs.readFileSync(filePath, 'utf-8');
+  const lines = fileContent.split('\n').filter(Boolean);
+  const offlineFusionEngine = createFusionEngine();
+  
+  const outputLines = [];
+  
+  lines.forEach(line => {
+    outputLines.push(line); // original detection/imu packet
+    
+    try {
+      const entry = JSON.parse(line);
+      const p = entry.packet;
+      if (p && p.id && p.type !== 'imu') {
+        // Run fusion and collect emitted tracks
+        offlineFusionEngine.fuseDetection(p, (track) => {
+          outputLines.push(JSON.stringify({ 
+            timestamp: entry.timestamp, 
+            packet: { type: 'track', ...track } 
+          }));
+        });
+      }
+    } catch(e) {
+      // Ignore parse errors on corrupted lines
+    }
+  });
+
+  res.send(outputLines.join('\n') + '\n');
+});
+
 // Start recording
 app.post('/api/recordings/start', (req, res) => {
   if (isRecording) {
@@ -193,12 +230,383 @@ let daemonProcesses = {}; // map of radarId -> child_process
 let liveImuData = {}; // map of radarId -> { pitch, roll, yaw }
 let activeWs = null; // track the currently active frontend WebSocket
 
+// ─────────────────────────────────────────────────────────────
+//  FUSION ENGINE — Motion-Aided Detection-to-Track Association
+// ─────────────────────────────────────────────────────────────
+
+let fusionConfig = {
+  maxAssocDistM: 150,        // max positional gate (meters, after kinematic prediction)
+  maxAssocTimeSec: 10,       // max seconds a track lives without an update
+  minDetectionsToConfirm: 2, // N-of-M confirmation before track is broadcast
+  classificationFusionMode: 'max_prob', // 'max_prob' | 'majority' | 'latest'
+  crossRadarFusion: true,    // fuse detections from different radars
+  maxHeadingDiffDeg: 60,     // max heading difference gate (degrees)
+  maxSpeedRatioFactor: 2.5,  // max speed ratio (faster/slower must be <= this)
+  wPosition: 0.6,            // weight of position component in combined cost
+  wVelocity: 0.4,            // weight of velocity component in combined cost
+  kalmanQ: 1e-7,             // process noise variance (lower = smoother, slower to adapt)
+  kalmanR: 2e-8,             // measurement noise variance (lower = trust measurement more)
+};
+
+function createFusionEngine() {
+  const fusionTracks = new Map(); // trackId -> FusedTrack
+  let trackCounter = 0;
+
+  // ─── Kalman Filter helpers ────────────────────────────────────────────────────
+  function kalmanInit(lat, lng, heading, speed) {
+    const headingRad = (heading || 0) * Math.PI / 180;
+    const metersPerDeg = 111320;
+    const vLat = (speed * Math.cos(headingRad)) / metersPerDeg;
+    const vLng = (speed * Math.sin(headingRad)) / (metersPerDeg * Math.cos(lat * Math.PI / 180) || 1);
+    return {
+      x: [lat, lng, vLat, vLng],   // state
+      P: [                          // covariance (diagonal, large init uncertainty)
+        [1e-6, 0,    0,     0    ],
+        [0,    1e-6, 0,     0    ],
+        [0,    0,    1e-8,  0    ],
+        [0,    0,    0,     1e-8 ],
+      ]
+    };
+  }
+
+  function kalmanPredict(kf, dtSec, Q) {
+    const [lat, lng, vLat, vLng] = kf.x;
+    const dt = dtSec;
+    const xPred = [ lat + vLat * dt, lng + vLng * dt, vLat, vLng ];
+    const q = Q;
+    const dt2 = dt * dt;
+    const dt4o4 = dt2 * dt2 / 4;
+    const P = kf.P;
+
+    const FPFt = [
+      [P[0][0] + dt*(P[2][0]+P[0][2]) + dt2*P[2][2],  P[0][1] + dt*(P[2][1]+P[0][3]) + dt2*P[2][3],  P[0][2] + dt*P[2][2],  P[0][3] + dt*P[2][3]],
+      [P[1][0] + dt*(P[3][0]+P[1][2]) + dt2*P[3][2],  P[1][1] + dt*(P[3][1]+P[1][3]) + dt2*P[3][3],  P[1][2] + dt*P[3][2],  P[1][3] + dt*P[3][3]],
+      [P[2][0] + dt*P[2][2],                           P[2][1] + dt*P[2][3],                           P[2][2],               P[2][3]              ],
+      [P[3][0] + dt*P[3][2],                           P[3][1] + dt*P[3][3],                           P[3][2],               P[3][3]              ],
+    ];
+
+    const PPred = [
+      [FPFt[0][0] + q*dt4o4, FPFt[0][1],           FPFt[0][2],      FPFt[0][3]      ],
+      [FPFt[1][0],           FPFt[1][1] + q*dt4o4, FPFt[1][2],      FPFt[1][3]      ],
+      [FPFt[2][0],           FPFt[2][1],           FPFt[2][2]+q*dt2, FPFt[2][3]     ],
+      [FPFt[3][0],           FPFt[3][1],           FPFt[3][2],      FPFt[3][3]+q*dt2],
+    ];
+
+    return { xPred, PPred };
+  }
+
+  function kalmanUpdate(xPred, PPred, measLat, measLng, R) {
+    const y0 = measLat - xPred[0];
+    const y1 = measLng - xPred[1];
+    const S00 = PPred[0][0] + R;
+    const S01 = PPred[0][1];
+    const S10 = PPred[1][0];
+    const S11 = PPred[1][1] + R;
+    const detS = S00 * S11 - S01 * S10;
+    if (Math.abs(detS) < 1e-30) return { x: xPred, P: PPred };
+    const Si00 =  S11 / detS;
+    const Si01 = -S01 / detS;
+    const Si10 = -S10 / detS;
+    const Si11 =  S00 / detS;
+
+    const PH = [[PPred[0][0], PPred[0][1]], [PPred[1][0], PPred[1][1]], [PPred[2][0], PPred[2][1]], [PPred[3][0], PPred[3][1]]];
+    const K = PH.map(row => [row[0]*Si00 + row[1]*Si10, row[0]*Si01 + row[1]*Si11]);
+
+    const xUpd = [
+      xPred[0] + K[0][0]*y0 + K[0][1]*y1,
+      xPred[1] + K[1][0]*y0 + K[1][1]*y1,
+      xPred[2] + K[2][0]*y0 + K[2][1]*y1,
+      xPred[3] + K[3][0]*y0 + K[3][1]*y1,
+    ];
+
+    const IKH = [
+      [1 - K[0][0], -K[0][1], 0, 0],
+      [-K[1][0], 1 - K[1][1], 0, 0],
+      [-K[2][0], -K[2][1],    1, 0],
+      [-K[3][0], -K[3][1],    0, 1],
+    ];
+
+    const PUpd = IKH.map((row) =>
+      PPred[0].map((_, j) =>
+        row[0]*PPred[0][j] + row[1]*PPred[1][j] + row[2]*PPred[2][j] + row[3]*PPred[3][j]
+      )
+    );
+
+    return { x: xUpd, P: PUpd };
+  }
+
+  function haversineDist(lat1, lng1, lat2, lng2) {
+    const R = 6371000;
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLng = (lng2 - lng1) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) ** 2 +
+      Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+
+  function headingDiff(h1, h2) {
+    let diff = Math.abs((h1 - h2 + 360) % 360);
+    if (diff > 180) diff = 360 - diff;
+    return diff;
+  }
+
+  function predictPosition(track, dtSec) {
+    const headingRad = (track.heading || 0) * Math.PI / 180;
+    const speed = track.speed || 0;
+    const vx = speed * Math.sin(headingRad);
+    const vy = speed * Math.cos(headingRad);
+    const metersPerLat = 111320;
+    const metersPerLng = 111320 * Math.cos((track.lat || 0) * Math.PI / 180);
+    return {
+      lat: track.lat + (vy * dtSec) / metersPerLat,
+      lng: track.lng + (vx * dtSec) / metersPerLng
+    };
+  }
+
+  function mergeProbUAV(track, detection, mode) {
+    const newProb = detection.probUAV !== undefined ? detection.probUAV :
+      (detection.classification === 'drone' ? 1.0 : detection.classification === 'bird' ? 0.05 : 0.5);
+    if (mode === 'max_prob') return Math.max(track.probUAV, newProb);
+    else if (mode === 'latest') return newProb;
+    else return 0.6 * track.probUAV + 0.4 * newProb;
+  }
+
+  return {
+    fuseDetection: (detection, emitTrackFn) => {
+      const now = detection.lastUpdated || Date.now();
+      const cfg = fusionConfig;
+
+      let bestTrack = null;
+      let bestCost = Infinity;
+
+      // 0. Hard ID match: If an active track is already tracking this exact radar detection ID,
+      // associate immediately. The radar's own ID continuity is highly reliable.
+      for (const [, track] of fusionTracks) {
+        if (track.sourceDetectionIds.includes(detection.id)) {
+          const dtSec = (now - track.lastUpdated) / 1000;
+          if (dtSec <= cfg.maxAssocTimeSec) {
+            bestTrack = track;
+            bestCost = 0;
+            break;
+          }
+        }
+      }
+
+      if (!bestTrack) {
+        for (const [, track] of fusionTracks) {
+        const dtSec = (now - track.lastUpdated) / 1000;
+        if (dtSec > cfg.maxAssocTimeSec) continue;
+
+        if (!cfg.crossRadarFusion && detection.radarId !== track.primaryRadarId) continue;
+
+        const predicted = predictPosition(track, dtSec);
+        const distToPredicted = haversineDist(detection.lat, detection.lng, predicted.lat, predicted.lng);
+        const distToLastKnown = haversineDist(detection.lat, detection.lng, track.lat, track.lng);
+
+        const detSpeed = detection.speed || 0;
+        const trkSpeed = track.speed || 0;
+        
+        let hDiff = 0;
+        if (detSpeed >= 1 && trkSpeed >= 1) {
+          hDiff = headingDiff(detection.heading || 0, track.heading || 0);
+        }
+        
+        let ratio = 1;
+        if (detSpeed >= 1 && trkSpeed >= 1) {
+          ratio = Math.max(detSpeed, trkSpeed) / Math.min(detSpeed, trkSpeed);
+        }
+
+        const passesKinematic = (distToPredicted <= cfg.maxAssocDistM) && 
+                                (hDiff <= cfg.maxHeadingDiffDeg) && 
+                                (ratio <= cfg.maxSpeedRatioFactor);
+
+        // Fallback: If kinematic prediction fails due to sharp maneuvers/turns, check if it's very close to last known position.
+        const passesFallback = (distToLastKnown <= cfg.maxAssocDistM);
+
+        if (!passesKinematic && !passesFallback) continue;
+
+        let totalCost;
+        if (passesKinematic) {
+          const positionCost = distToPredicted / cfg.maxAssocDistM;
+          const headingCost = hDiff / cfg.maxHeadingDiffDeg;
+          const speedCost = (detSpeed >= 1 && trkSpeed >= 1) ? Math.abs(detSpeed - trkSpeed) / Math.max(detSpeed, trkSpeed, 1) : 0;
+          const velocityCost = 0.6 * headingCost + 0.4 * speedCost;
+          totalCost = cfg.wPosition * positionCost + cfg.wVelocity * velocityCost;
+        } else {
+          // Fallback cost: heavily penalize so that true kinematic matches always win if they exist, 
+          // but allow association if no better track is found.
+          totalCost = 1.0 + (distToLastKnown / cfg.maxAssocDistM);
+        }
+
+        if (totalCost < bestCost) {
+          bestCost = totalCost;
+          bestTrack = track;
+        }
+      }
+      }
+
+      if (bestTrack) {
+        const dtSec = (now - bestTrack.lastUpdated) / 1000;
+        const { xPred, PPred } = kalmanPredict(bestTrack.kalman, dtSec, cfg.kalmanQ);
+
+        // --- Outlier Rejection (Multipath Glitch Protection) ---
+        const dLat = detection.lat - bestTrack.lat;
+        const dLng = (detection.lng - bestTrack.lng) * Math.cos(bestTrack.lat * Math.PI / 180);
+        const mPerDeg = 111320;
+        const jumpDistanceM = Math.sqrt(dLat*dLat + dLng*dLng) * mPerDeg;
+        const requiredSpeed = dtSec > 0 ? jumpDistanceM / dtSec : 0;
+        const reportedSpeed = detection.speed || 0;
+        
+        // If the target jumped more than 50m, requiring a speed > 100m/s, but radar reports low doppler speed:
+        const isGlitch = jumpDistanceM > 50 && requiredSpeed > 100 && requiredSpeed > reportedSpeed * 5;
+
+        let xUpd, PUpd;
+        if (isGlitch) {
+          // Ignore the glitchy coordinates, just use the Kalman prediction
+          xUpd = xPred;
+          PUpd = PPred;
+        } else {
+          const res = kalmanUpdate(xPred, PPred, detection.lat, detection.lng, cfg.kalmanR);
+          xUpd = res.x;
+          PUpd = res.P;
+        }
+
+        bestTrack.kalman = { x: xUpd, P: PUpd };
+        bestTrack.lat = xUpd[0];
+        bestTrack.lng = xUpd[1];
+
+        const metersPerDeg = 111320;
+        const vLatMs = xUpd[2] * metersPerDeg;
+        const vLngMs = xUpd[3] * metersPerDeg * Math.cos(xUpd[0] * Math.PI / 180);
+        const kalmanSpeed = Math.sqrt(vLatMs * vLatMs + vLngMs * vLngMs);
+        const kalmanHeading = (Math.atan2(vLngMs, vLatMs) * 180 / Math.PI + 360) % 360;
+
+        if (kalmanSpeed >= 0.5) {
+          bestTrack.speed   = 0.7 * kalmanSpeed + 0.3 * (detection.speed || 0);
+          bestTrack.heading = kalmanSpeed > 1 ? kalmanHeading : (detection.heading || bestTrack.heading);
+        } else {
+          bestTrack.speed   = detection.speed || bestTrack.speed;
+          bestTrack.heading = detection.heading !== undefined ? detection.heading : bestTrack.heading;
+        }
+
+        bestTrack.alt = 0.6 * (detection.alt || bestTrack.alt) + 0.4 * bestTrack.alt;
+        bestTrack.probUAV = mergeProbUAV(bestTrack, detection, cfg.classificationFusionMode);
+        bestTrack.classification = bestTrack.probUAV > 0.5 ? 'drone' : (bestTrack.probUAV < 0.15 ? 'bird' : 'unknown');
+        bestTrack.confidence = detection.confidence || bestTrack.confidence;
+        bestTrack.lastUpdated = now;
+        bestTrack.detectionCount += 1;
+        if (!bestTrack.sourceDetectionIds.includes(detection.id)) {
+          bestTrack.sourceDetectionIds.push(detection.id);
+        }
+        if (!bestTrack.radarIds.includes(detection.radarId)) {
+          bestTrack.radarIds.push(detection.radarId);
+        }
+        bestTrack.historyHeading = bestTrack.historyHeading || [];
+        bestTrack.historySpeed = bestTrack.historySpeed || [];
+        bestTrack.historyHeading.push(kalmanHeading);
+        bestTrack.historySpeed.push(kalmanSpeed);
+        if (bestTrack.historyHeading.length > 30) bestTrack.historyHeading.shift();
+        if (bestTrack.historySpeed.length > 30) bestTrack.historySpeed.shift();
+
+        // Kinematic Classification Heuristic
+        if (bestTrack.historySpeed.length >= 20) {
+           const avgS = bestTrack.historySpeed.reduce((a,b)=>a+b,0)/bestTrack.historySpeed.length;
+           const varS = bestTrack.historySpeed.reduce((a,b)=>a+Math.pow(b-avgS,2),0)/bestTrack.historySpeed.length;
+           const stdS = Math.sqrt(varS);
+           const rcs = (bestTrack.raw && bestTrack.raw.rcs !== undefined) ? bestTrack.raw.rcs : -999;
+           
+           // If target maintains steady high speed and has drone-like RCS, boost its probability.
+           if (avgS >= 8 && stdS <= 3.5 && rcs >= -18) {
+               bestTrack.probUAV = Math.max(bestTrack.probUAV, 0.6); // Override to drone
+           }
+        }
+
+        bestTrack.classification = bestTrack.probUAV > 0.5 ? 'drone' : (bestTrack.probUAV < 0.15 ? 'bird' : 'unknown');
+        bestTrack.raw = detection.raw || bestTrack.raw;
+
+        if (!bestTrack.isConfirmed && bestTrack.detectionCount >= cfg.minDetectionsToConfirm) {
+          bestTrack.isConfirmed = true;
+          // console.log(`[Fusion] Track ${bestTrack.id} CONFIRMED (${bestTrack.detectionCount} detections)`);
+        }
+
+        if (bestTrack.isConfirmed) {
+          emitTrackFn({ type: 'track', ...bestTrack, kalman: undefined });
+        }
+      } else {
+        trackCounter += 1;
+        const trackId = `TRK-${String(trackCounter).padStart(4, '0')}`;
+        const initProb = detection.probUAV !== undefined ? detection.probUAV :
+          (detection.classification === 'drone' ? 1.0 : detection.classification === 'bird' ? 0.05 : 0.5);
+        const newTrack = {
+          id: trackId,
+          primaryRadarId: detection.radarId,
+          radarIds: [detection.radarId],
+          sourceDetectionIds: [detection.id],
+          lat: detection.lat,
+          lng: detection.lng,
+          alt: detection.alt || 0,
+          speed: detection.speed || 0,
+          heading: detection.heading || 0,
+          classification: detection.classification || 'unknown',
+          probUAV: initProb,
+          confidence: detection.confidence || 0,
+          lastUpdated: now,
+          firstSeen: now,
+          detectionCount: 1,
+          isConfirmed: false,
+          raw: detection.raw,
+          historyHeading: [detection.heading || 0],
+          historySpeed: [detection.speed || 0],
+          kalman: kalmanInit(detection.lat, detection.lng, detection.heading || 0, detection.speed || 0),
+        };
+        fusionTracks.set(trackId, newTrack);
+      }
+    },
+    cleanup: (now) => {
+      const cfg = fusionConfig;
+      for (const [trackId, track] of fusionTracks) {
+        if ((now - track.lastUpdated) / 1000 > cfg.maxAssocTimeSec) {
+          fusionTracks.delete(trackId);
+        }
+      }
+    }
+  };
+}
+
+// Live engine instance
+const liveFusionEngine = createFusionEngine();
+
+setInterval(() => {
+  liveFusionEngine.cleanup(Date.now());
+}, 2000);
+
 // Safely send a message to the current active frontend WebSocket
 function sendToFrontend(data) {
   if (activeWs && activeWs.readyState === WebSocket.OPEN) {
     activeWs.send(JSON.stringify(data));
   }
 }
+
+// ── Fusion config API endpoints ──────────────────────────────
+app.get('/api/fusion/config', (req, res) => {
+  res.json(fusionConfig);
+});
+
+app.post('/api/fusion/config', (req, res) => {
+  const allowed = [
+    'maxAssocDistM', 'maxAssocTimeSec', 'minDetectionsToConfirm',
+    'classificationFusionMode', 'crossRadarFusion',
+    'maxHeadingDiffDeg', 'maxSpeedRatioFactor', 'wPosition', 'wVelocity',
+    'kalmanQ', 'kalmanR'
+  ];
+  allowed.forEach(key => {
+    if (req.body[key] !== undefined) {
+      fusionConfig[key] = req.body[key];
+    }
+  });
+  console.log('[Fusion] Config updated:', fusionConfig);
+  res.json({ success: true, config: fusionConfig });
+});
 
 const net = require('net');
 
@@ -383,6 +791,7 @@ function spawnDaemon(radar) {
           };
           recordTelemetry(detection);
           sendToFrontend(detection);
+          liveFusionEngine.fuseDetection(detection, sendToFrontend);
         } else if (msg.type === 'imu') {
           const qx = msg.quat_x;
           const qy = msg.quat_y;
