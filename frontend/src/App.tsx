@@ -60,6 +60,26 @@ type Detection = {
   raw?: any;
 };
 
+type FusedTrack = {
+  id: string;               // stable TRK-NNNN identifier
+  radarIds: number[];       // all radars that contributed
+  lat: number;
+  lng: number;
+  alt: number;
+  speed: number;
+  heading: number;
+  classification: 'drone' | 'unknown' | 'bird';
+  probUAV: number;
+  confidence: number;
+  lastUpdated: number;
+  firstSeen: number;
+  detectionCount: number;
+  isConfirmed: boolean;
+  raw?: any;
+};
+
+type DisplayMode = 'detections' | 'tracks' | 'both';
+
 type MapFilters = {
   showDrone: boolean;
   showUnknown: boolean;
@@ -239,7 +259,16 @@ export default function App() {
   
   // Track Actions State
   const [ignoredDetections, setIgnoredDetections] = useState<Set<string>>(new Set());
+  const [ignoredTracks, setIgnoredTracks] = useState<Set<string>>(new Set());
   const [trackHistory, setTrackHistory] = useState<Record<string, {pos: [number, number], time: number}[]>>({});
+
+  // Fused Tracks State
+  const [tracks, setTracks] = useState<FusedTrack[]>([]);
+  const [trackHistory_fused, setTrackHistory_fused] = useState<Record<string, {pos: [number, number], time: number}[]>>({});
+  const [displayMode, setDisplayMode] = useState<DisplayMode>(() => {
+    const saved = localStorage.getItem('mitzpe_metzoda_display_mode');
+    return (saved === 'detections' || saved === 'tracks' || saved === 'both') ? saved as DisplayMode : 'tracks';
+  });
 
   // Ignore Zones State
   const [ignoreZones, setIgnoreZones] = useState<IgnoreZone[]>(() => {
@@ -411,6 +440,8 @@ export default function App() {
     drawZone:       lang === 'he' ? '+ שרטט אזור התעלמות' : '+ Draw Ignore Zone',
     // Right panel
     activeDetections: lang === 'he' ? 'גילויים פעילים'  : 'Active Detections',
+    activeTracks:   lang === 'he' ? 'Tracks פעילים'   : 'Active Tracks',
+    activeItems:    lang === 'he' ? 'מטרות פעילות'    : 'Active Targets',
     center:         lang === 'he' ? 'מרכז'             : 'Center',
     trailLengthLabel: lang === 'he' ? 'אורך שובל (שניות)' : 'Trail Length (sec)',
     drop:           lang === 'he' ? 'הסר'              : 'Drop',
@@ -480,6 +511,24 @@ export default function App() {
     saveDefense:    lang === 'he' ? 'שמור מרחב הגנה'    : 'Save Defense Zone',
     debugMode:      lang === 'he' ? 'מצב דיבאג (הצגת מידע גולמי)' : 'Debug Mode (Raw Data)',
     filterFov:      lang === 'he' ? 'סינון גילויים מחוץ ל-FOV' : 'Filter detections outside FOV',
+    // Fusion / Display mode
+    fusionTitle:    lang === 'he' ? 'מנוע היתוך (Fusion)' : 'Fusion Engine',
+    displayModeLabel: lang === 'he' ? 'מצב תצוגה' : 'Display Mode',
+    modeDetections: lang === 'he' ? 'גילויים גולמיים בלבד' : 'Raw Detections Only',
+    modeTracks:     lang === 'he' ? 'Tracks מהותכים בלבד' : 'Fused Tracks Only',
+    modeBoth:       lang === 'he' ? 'גילויים + Tracks' : 'Both Detections & Tracks',
+    fusionParamsLabel: lang === 'he' ? 'פרמטרי קורלציה' : 'Correlation Parameters',
+    maxDistLabel:   lang === 'he' ? 'מרחק gate מקסימלי (מ\')' : 'Max Position Gate (m)',
+    maxTimeLabel:   lang === 'he' ? 'זמן מקסימלי ללא עדכון (שנ\')' : 'Max Stale Time (sec)',
+    minConfirmLabel: lang === 'he' ? 'גילויים מינ\' לאישור Track' : 'Min Detections to Confirm',
+    maxHeadingLabel: lang === 'he' ? 'gate כיוון מקסימלי (מעלות)' : 'Max Heading Gate (deg)',
+    maxSpeedRatioLabel: lang === 'he' ? 'יחס מהירות מקסימלי' : 'Max Speed Ratio',
+    wPositionLabel: lang === 'he' ? 'משקל מיקום בעלות' : 'Position Weight in Cost',
+    wVelocityLabel: lang === 'he' ? 'משקל מהירות בעלות' : 'Velocity Weight in Cost',
+    crossRadarLabel: lang === 'he' ? 'קורלציה בין מכ"מים' : 'Cross-Radar Fusion',
+    classFusionModeLabel: lang === 'he' ? 'שיטת מיזוג סיווג' : 'Classification Fusion Mode',
+    trackLabel:     lang === 'he' ? 'Track' : 'Track',
+    radarsLabel:    lang === 'he' ? 'מכ"מים' : 'radars',
   };
 
   // Defense Zones state
@@ -830,7 +879,41 @@ export default function App() {
     localStorage.setItem('mitzpe_metzoda_filters', JSON.stringify(filters));
   }, [filters]);
 
+  useEffect(() => {
+    localStorage.setItem('mitzpe_metzoda_display_mode', displayMode);
+  }, [displayMode]);
+
   const selectedRadar = radars.find((r) => r.id === selectedRadarId)!;
+
+  // ─── processNewTrack: fused track ingestion (mirrors processNewDetection) ───
+  const processNewTrack = useCallback((newTrack: FusedTrack) => {
+    if (ignoredTracks.has(newTrack.id)) return;
+
+    setTracks(prev => {
+      const filtered = prev.filter(t => t.id !== newTrack.id);
+      return [...filtered, newTrack];
+    });
+
+    setTrackHistory_fused(prev => {
+      const existing = prev[newTrack.id] || [];
+      const updated = [...existing, { pos: [newTrack.lng, newTrack.lat] as [number, number], time: Date.now() }];
+      const cutoff = Date.now() - 60000;
+      return { ...prev, [newTrack.id]: updated.filter(p => p.time > cutoff) };
+    });
+  }, [ignoredTracks]);
+
+  // fusionConfigState: mirrors backend fusionConfig for the admin UI inputs
+  const [fusionConfigState, setFusionConfigState] = useState<any>({
+    maxAssocDistM: 150, maxAssocTimeSec: 10, minDetectionsToConfirm: 2,
+    classificationFusionMode: 'max_prob', crossRadarFusion: true,
+    maxHeadingDiffDeg: 60, maxSpeedRatioFactor: 2.5, wPosition: 0.6, wVelocity: 0.4
+  });
+  useEffect(() => {
+    fetch('/api/fusion/config')
+      .then(r => r.json())
+      .then(cfg => setFusionConfigState(cfg))
+      .catch(() => {/* backend may not be running in simulation mode */});
+  }, []);
 
   const processNewDetection = useCallback((newDet: Detection) => {
     if (ignoredDetections.has(newDet.id)) return;
@@ -932,6 +1015,12 @@ export default function App() {
           }
 
           // Track/detection data from daemon
+          if (data.type === 'track' && data.id) {
+            // Fused track from backend fusion engine
+            processNewTrack(data as FusedTrack);
+            return;
+          }
+
           if (data.id) {
             const rid = data.radarId != null ? (typeof data.radarId === 'number' ? data.radarId : parseInt(data.radarId, 10)) : selectedRadarId;
             processNewDetection({
@@ -1093,6 +1182,35 @@ export default function App() {
         }
         return kept;
       });
+
+      // Also clean up expired fused tracks
+      setTracks(prev => {
+        const kept: FusedTrack[] = [];
+        const removedIds: string[] = [];
+        for (const tr of prev) {
+          // Use the longest fade threshold among all contributing radars
+          const maxFade = Math.max(...(tr.radarIds || []).map(rid => {
+            const r = radars.find(x => x.id === rid);
+            return r ? r.fadeThreshold : selectedRadar.fadeThreshold;
+          })) * 1000;
+          if ((now - tr.lastUpdated) < maxFade) {
+            kept.push(tr);
+          } else {
+            removedIds.push(tr.id);
+          }
+        }
+        if (removedIds.length > 0) {
+          setTrackHistory_fused(prevHistory => {
+            const updated = { ...prevHistory };
+            removedIds.forEach(id => { delete updated[id]; });
+            return updated;
+          });
+          if (selectedDetection && removedIds.includes(selectedDetection.id)) {
+            setSelectedDetection(null);
+          }
+        }
+        return kept;
+      });
     }, 1000);
     return () => clearInterval(interval);
   }, [radars, selectedDetection, selectedRadar]);
@@ -1212,7 +1330,7 @@ export default function App() {
 
       // --- Step 3: Emit updated positions as detections ---
       tracks.forEach(track => {
-        processNewDetection({
+        const det: Detection = {
           id: track.id,
           radarId: track.radarId,
           lat: track.lat,
@@ -1224,7 +1342,27 @@ export default function App() {
           heading: track.heading,
           lastUpdated: now,
           probUAV: track.probUAV,
-        });
+        };
+        processNewDetection(det);
+
+        // Also directly promote sim tracks to fused tracks (confirmed immediately in simulation)
+        const fusedTrk: FusedTrack = {
+          id: `TRK-SIM-${track.id}`,
+          radarIds: [track.radarId],
+          lat: track.lat,
+          lng: track.lng,
+          alt: track.alt,
+          speed: track.speed,
+          heading: track.heading,
+          classification: track.classification,
+          probUAV: track.probUAV ?? (track.classification === 'drone' ? 0.9 : 0.1),
+          confidence: track.confidence,
+          lastUpdated: now,
+          firstSeen: track.createdAt,
+          detectionCount: Math.round((now - track.createdAt) / 500) + 1,
+          isConfirmed: true,
+        };
+        processNewTrack(fusedTrk);
       });
 
     }, TICK_MS);
@@ -1264,18 +1402,22 @@ export default function App() {
   };
 
   const handleCenterSelected = () => {
-    if (selectedDetection && mapRef.current) {
-      mapRef.current.flyTo({ center: [selectedDetection.lng, selectedDetection.lat], duration: 1000 });
+    if (currentSelectedDetection && mapRef.current) {
+      mapRef.current.flyTo({ center: [currentSelectedDetection.lng, currentSelectedDetection.lat], duration: 1000 });
     }
   };
 
   const handleDeleteSelected = () => {
     if (!selectedDetection) return;
     const idToDelete = selectedDetection.id;
+    // Delete from detections
     setIgnoredDetections(prev => new Set(prev).add(idToDelete));
     setDetections(prev => prev.filter(d => d.id !== idToDelete));
-    // FIX: also clear trail history so the line disappears immediately
     setTrackHistory(prev => { const n = { ...prev }; delete n[idToDelete]; return n; });
+    // Also delete from tracks if it matches a track ID
+    setIgnoredTracks(prev => new Set(prev).add(idToDelete));
+    setTracks(prev => prev.filter(t => t.id !== idToDelete));
+    setTrackHistory_fused(prev => { const n = { ...prev }; delete n[idToDelete]; return n; });
     setSelectedDetection(null);
   };
 
@@ -1307,7 +1449,7 @@ export default function App() {
 
     const loadPlaybackFile = async () => {
       try {
-        const response = await fetch(`/api/recordings/download/${selectedPlaybackFile}`);
+        const response = await fetch(`/api/recordings/download_fused/${selectedPlaybackFile}`);
         const text = await response.text();
         const lines = text.split('\n').filter(Boolean);
         const parsed = lines.map(line => JSON.parse(line));
@@ -1356,32 +1498,42 @@ export default function App() {
 
     // Use current fade threshold
     const fadeMs = selectedRadar.fadeThreshold * 1000;
+    
+    // Optimization: find the current index for timeMs using binary search
+    let right = packets.length - 1;
+    let left = 0;
+    while (left <= right) {
+      const mid = Math.floor((left + right) / 2);
+      if (packets[mid].timestamp <= timeMs) left = mid + 1;
+      else right = mid - 1;
+    }
+    const endIdx = right; // last packet <= timeMs
+
     const activeDets: Record<string, Detection> = {};
+    const activeTracks: Record<string, FusedTrack> = {};
     const imus: Record<number, any> = {};
 
-    packets.forEach(entry => {
-      if (entry.timestamp > timeMs) return;
+    const minTime = timeMs - Math.max(fadeMs, 5000); // look back up to fadeMs or 5s for IMU
+
+    for (let i = endIdx; i >= 0; i--) {
+      const entry = packets[i];
+      if (entry.timestamp < minTime) break; // Stop when outside the lookback window
 
       const p = entry.packet;
-      if (!p) return;
+      if (!p) continue;
 
       if (p.type === 'imu') {
-        if (!imus[p.radarId] || imus[p.radarId].timestamp < entry.timestamp) {
-          imus[p.radarId] = { ...p, timestamp: entry.timestamp };
-        }
+        if (!imus[p.radarId]) imus[p.radarId] = { ...p, timestamp: entry.timestamp };
       } else if (p.id) {
-        // It's a track/detection
         if (entry.timestamp > timeMs - fadeMs) {
-          if (!activeDets[p.id] || activeDets[p.id].lastUpdated < entry.timestamp) {
-            activeDets[p.id] = {
-              ...p,
-              // Store relative timestamp temporarily as lastUpdated for local coordinate calculations
-              lastUpdated: entry.timestamp
-            };
+          if (p.type === 'track') {
+            if (!activeTracks[p.id]) activeTracks[p.id] = { ...p, lastUpdated: entry.timestamp };
+          } else {
+            if (!activeDets[p.id]) activeDets[p.id] = { ...p, lastUpdated: entry.timestamp };
           }
         }
       }
-    });
+    }
 
     // Map the relative timestamp to standard Date.now() representation so rendering matches normal logic
     const mappedDets = Object.values(activeDets).map(d => ({
@@ -1389,7 +1541,38 @@ export default function App() {
       lastUpdated: Date.now() - (timeMs - d.lastUpdated)
     }));
 
+    const mappedTracks = Object.values(activeTracks).map(t => ({
+      ...t,
+      lastUpdated: Date.now() - (timeMs - t.lastUpdated)
+    }));
+
+    const activeTrackIds = new Set(mappedTracks.map(t => t.id));
+
+    // Single atomic state update — avoids N intermediate renders
     setDetections(mappedDets);
+    setTracks(() => {
+      // Note: backend generated tracks are named TRK-..., so we replace them all for playback.
+      // Wait, if it's playback mode, we just use mappedTracks!
+      return mappedTracks;
+    });
+    setTrackHistory_fused(prev => {
+      const next = { ...prev };
+      // Remove history for expired tracks
+      Object.keys(next).forEach(k => {
+        if (!activeTrackIds.has(k)) delete next[k];
+      });
+      // Append current position for each active track
+      mappedTracks.forEach(t => {
+        const existing = next[t.id] || [];
+        const cutoff = Date.now() - 60000;
+        next[t.id] = [
+          ...existing.filter(p => p.time > cutoff),
+          { pos: [t.lng, t.lat] as [number, number], time: Date.now() }
+        ];
+      });
+      return next;
+    });
+    // ─────────────────────────────────────────────────────────────────────────
 
     // Sync live IMU data
     const imuData: any = {};
@@ -1567,7 +1750,7 @@ export default function App() {
     const sourceRadar = radars.find(r => r.id === d.radarId) || selectedRadar;
     const agl = d.alt - (sourceRadar.homeLocation[2] || 0);
 
-    if (!reason && (agl < filters.minAgl || agl > filters.maxAgl)) {
+    if (!reason && classification !== 'drone' && (agl < filters.minAgl || agl > filters.maxAgl)) {
       reason = `agl ${agl} out of bounds (${filters.minAgl}-${filters.maxAgl})`;
     }
 
@@ -1592,10 +1775,54 @@ export default function App() {
     return true;
   });
 
+  // Fused tracks filter — same logic applied to Track layer
+  const filteredTracks = tracks.filter(tr => {
+    if (ignoredTracks.has(tr.id)) return false;
+    const classification = getClassification(tr as any);
+    if (classification === 'drone' && !filters.showDrone) return false;
+    if (classification === 'unknown' && !filters.showUnknown) return false;
+    if (classification === 'bird' && !filters.showBird) return false;
+    if (tr.speed < filters.minSpeed || tr.speed > filters.maxSpeed) return false;
+    const agl = tr.alt - (selectedRadar.homeLocation[2] || 0);
+    if (classification !== 'drone' && (agl < filters.minAgl || agl > filters.maxAgl)) return false;
+    const pt = turf.point([tr.lng, tr.lat]);
+    for (const zone of ignoreZones) {
+      if (agl >= zone.minAgl && agl <= zone.maxAgl) {
+        if (zone.type === 'polygon' && zone.coordinates.length >= 4) {
+          const poly = turf.polygon([zone.coordinates]);
+          if (turf.booleanPointInPolygon(pt, poly)) return false;
+        } else if (zone.type === 'circle' && zone.radius) {
+          const center = turf.point(zone.coordinates[0]);
+          const distance = turf.distance(center, pt, { units: 'meters' });
+          if (distance <= zone.radius) return false;
+        }
+      }
+    }
+    return true;
+  });
+
+  // Unified visible items list (detection-shaped) for threat scoring and popups
+  const visibleDetections: Detection[] = displayMode === 'tracks'
+    ? filteredTracks.map(tr => ({
+        id: tr.id, radarId: (tr.radarIds?.[0] ?? 0), lat: tr.lat, lng: tr.lng, alt: tr.alt,
+        classification: tr.classification, confidence: tr.confidence, speed: tr.speed,
+        heading: tr.heading, lastUpdated: tr.lastUpdated, probUAV: tr.probUAV, raw: tr.raw
+      } as Detection))
+    : displayMode === 'both'
+    ? [
+        ...filteredDetections,
+        ...filteredTracks.map(tr => ({
+          id: tr.id, radarId: (tr.radarIds?.[0] ?? 0), lat: tr.lat, lng: tr.lng, alt: tr.alt,
+          classification: tr.classification, confidence: tr.confidence, speed: tr.speed,
+          heading: tr.heading, lastUpdated: tr.lastUpdated, probUAV: tr.probUAV, raw: tr.raw
+        } as Detection))
+      ]
+    : filteredDetections;
+
   // Threat alert check loop
   useEffect(() => {
-    const activeIds = new Set(filteredDetections.map(d => d.id));
-    const currentThreats = filteredDetections.filter(d => {
+    const activeIds = new Set(visibleDetections.map(d => d.id));
+    const currentThreats = visibleDetections.filter(d => {
       const score = defenseZones.length > 0 
         ? computeThreatScore(d, defenseZones, threatWeights).score
         : (getClassification(d) === 'drone' ? 1.0 : 0.0);
@@ -1628,7 +1855,7 @@ export default function App() {
 
       // Update existing popups with live data or mark them offline if target disappeared
       updated = updated.map(p => {
-        const activeDet = filteredDetections.find(d => d.id === p.id);
+        const activeDet = visibleDetections.find(d => d.id === p.id);
         if (activeDet) {
           const score = defenseZones.length > 0 
             ? computeThreatScore(activeDet, defenseZones, threatWeights).score
@@ -1698,30 +1925,44 @@ export default function App() {
       return changed ? updated : prev;
     });
 
-  }, [filteredDetections, defenseZones, threatWeights, alertThreshold, alertPopupDuration, getClassification, playAlertSound, closedThreatAlertIds]);
+  }, [visibleDetections, defenseZones, threatWeights, alertThreshold, alertPopupDuration, getClassification, playAlertSound, closedThreatAlertIds]);
 
   const masterPowerActive = radars.some(r => r.isActive);
   const currentSelectedDetection = selectedDetection 
-    ? detections.find(d => d.id === selectedDetection.id) || null 
+    ? visibleDetections.find(d => d.id === selectedDetection.id) || null 
     : null;
 
   const trailsGeoJson = useMemo(() => {
     const features: any[] = [];
     const cutoff = Date.now() - (filters.trailLengthSeconds * 1000);
     
-    filteredDetections.forEach(d => {
-      const history = trackHistory[d.id];
-      if (history) {
-        const validHistory = history.filter(p => p.time >= cutoff);
-        if (validHistory.length >= 2) {
-          features.push(turf.lineString(validHistory.map(p => p.pos)));
+    if (displayMode !== 'tracks') {
+      filteredDetections.forEach(d => {
+        const history = trackHistory[d.id];
+        if (history) {
+          const validHistory = history.filter(p => p.time >= cutoff);
+          if (validHistory.length >= 2) {
+            features.push({ ...turf.lineString(validHistory.map(p => p.pos)), properties: { isFused: false } });
+          }
         }
-      }
-    });
+      });
+    }
+
+    if (displayMode !== 'detections') {
+      filteredTracks.forEach(tr => {
+        const history = trackHistory_fused[tr.id];
+        if (history) {
+          const validHistory = history.filter(p => p.time >= cutoff);
+          if (validHistory.length >= 2) {
+            features.push({ ...turf.lineString(validHistory.map(p => p.pos)), properties: { isFused: true } });
+          }
+        }
+      });
+    }
     
     if (features.length === 0) return null;
     return turf.featureCollection(features);
-  }, [filteredDetections, trackHistory, filters.trailLengthSeconds]);
+  }, [displayMode, filteredDetections, filteredTracks, trackHistory, trackHistory_fused, filters.trailLengthSeconds]);
 
   // Dynamic Map Style based on user choice
   const mapStyleMemo = useMemo(() => {
@@ -1858,26 +2099,31 @@ export default function App() {
           </Source>
         )}
 
-        {/* Trails */}
+        {/* Trails — detections (amber) and fused tracks (cyan, thicker) */}
         {trailsGeoJson && (
           <Source id="trails-source" type="geojson" data={trailsGeoJson}>
-            <Layer id="trails-layer" type="line" paint={{ 'line-color': '#FBBF24', 'line-width': 3, 'line-opacity': 0.8 }} />
+            {/* Raw detection trails — amber */}
+            <Layer id="trails-layer-det" type="line"
+              filter={['!', ['boolean', ['get', 'isFused'], false]]}
+              paint={{ 'line-color': '#FBBF24', 'line-width': 3, 'line-opacity': 0.8 }} />
+            {/* Fused track trails — cyan, thicker */}
+            <Layer id="trails-layer-trk" type="line"
+              filter={['boolean', ['get', 'isFused'], false]}
+              paint={{ 'line-color': '#00E5FF', 'line-width': 4.5, 'line-opacity': 0.9 }} />
           </Source>
         )}
 
-        {/* Detections as Markers */}
-        {filteredDetections.map(d => {
+        {/* Raw Detection Markers */}
+        {displayMode !== 'tracks' && filteredDetections.map(d => {
           const isSelected = currentSelectedDetection?.id === d.id;
           const classification = getClassification(d);
           const aglMeters = getTerrainAgl(d.lng, d.lat, d.alt);
           
           let color = 'var(--accent-orange)';
           if (defenseZones.length > 0) {
-            // Compute dynamic color based on threat score when defense zones are defined
             const { score } = computeThreatScore(d, defenseZones, threatWeights);
             color = getThreatColor(score);
           } else {
-            // Default color based on classification
             if (classification === 'drone') color = 'var(--accent-red)';
             else if (classification === 'bird') color = '#10B981';
           }
@@ -1918,7 +2164,7 @@ export default function App() {
                     <path d="M12 9v4"/>
                   </svg>
                 )}
-                {/* AGL label — counter-rotate so it stays horizontal regardless of heading */}
+                {/* AGL label */}
                 <div style={{
                   transform: `rotate(${-d.heading}deg)`,
                   marginTop: '2px',
@@ -1933,6 +2179,113 @@ export default function App() {
                   letterSpacing: '0.3px',
                 }}>
                   ↑ {aglMeters}m
+                </div>
+              </div>
+            </Marker>
+          );
+        })}
+
+        {/* Fused Track Markers — double-ring visual */}
+        {displayMode !== 'detections' && filteredTracks.map(tr => {
+          const trAsDet: Detection = {
+            id: tr.id, radarId: tr.radarIds?.[0] ?? 0, lat: tr.lat, lng: tr.lng, alt: tr.alt,
+            classification: tr.classification, confidence: tr.confidence, speed: tr.speed,
+            heading: tr.heading, lastUpdated: tr.lastUpdated, probUAV: tr.probUAV, raw: tr.raw
+          };
+          const isSelected = currentSelectedDetection?.id === tr.id;
+          const classification = getClassification(trAsDet);
+          const aglMeters = getTerrainAgl(tr.lng, tr.lat, tr.alt);
+
+          let color = '#00E5FF'; // cyan base for tracks
+          if (defenseZones.length > 0) {
+            const { score } = computeThreatScore(trAsDet, defenseZones, threatWeights);
+            color = getThreatColor(score);
+          } else {
+            if (classification === 'drone') color = '#FF6B6B';
+            else if (classification === 'bird') color = '#34D399';
+          }
+
+          const multiRadar = (tr.radarIds?.length ?? 1) > 1;
+
+          return (
+            <Marker
+              key={tr.id}
+              longitude={tr.lng} latitude={tr.lat}
+              onClick={(e) => { e.originalEvent.stopPropagation(); setSelectedDetection(trAsDet); }}
+            >
+              <div
+                style={{
+                  display: 'flex', flexDirection: 'column', alignItems: 'center',
+                  transform: `rotate(${tr.heading}deg) ${isSelected ? 'scale(1.25)' : 'scale(1)'}`,
+                  transition: 'all 0.2s', cursor: 'pointer'
+                }}
+              >
+                {/* Double-ring icon */}
+                <div style={{ position: 'relative', width: 40, height: 40, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  {/* Outer ring */}
+                  <div style={{
+                    position: 'absolute', width: 40, height: 40, borderRadius: '50%',
+                    border: `2px solid ${color}`, opacity: 0.5,
+                    boxShadow: `0 0 8px ${color}55`
+                  }} />
+                  {/* Inner icon */}
+                  <div style={{ color, filter: `drop-shadow(0 0 6px ${color})` }}>
+                    {classification === 'drone' && (
+                      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <circle cx="12" cy="12" r="3" fill="currentColor"/>
+                        <path d="M6 6l12 12M18 6L6 18" />
+                        <circle cx="5" cy="5" r="2" />
+                        <circle cx="19" cy="5" r="2" />
+                        <circle cx="5" cy="19" r="2" />
+                        <circle cx="19" cy="19" r="2" />
+                      </svg>
+                    )}
+                    {classification === 'unknown' && (
+                      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <ellipse cx="12" cy="12" rx="9" ry="3.5"/>
+                        <path d="M5 14.5c0 0 2 1.5 7 1.5s7-1.5 7-1.5"/>
+                        <circle cx="9" cy="12" r="0.8" fill="currentColor"/>
+                        <circle cx="12" cy="12" r="0.8" fill="currentColor"/>
+                        <circle cx="15" cy="12" r="0.8" fill="currentColor"/>
+                      </svg>
+                    )}
+                    {classification === 'bird' && (
+                      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M3 10c4-4 8-4 10-1 2-3 6-3 10 1-4 2-8 1-10-2-2 3-6 4-10 2z"/>
+                        <path d="M12 9v4"/>
+                      </svg>
+                    )}
+                  </div>
+                  {/* Multi-radar badge */}
+                  {multiRadar && (
+                    <div style={{
+                      position: 'absolute', top: -4, right: -4,
+                      background: '#FFD700', color: '#000',
+                      borderRadius: '50%', width: 14, height: 14,
+                      fontSize: '9px', fontWeight: 'bold',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      transform: `rotate(${-tr.heading}deg)`
+                    }}>{tr.radarIds.length}</div>
+                  )}
+                </div>
+                {/* TRK label + AGL */}
+                <div style={{
+                  transform: `rotate(${-tr.heading}deg)`,
+                  marginTop: '2px',
+                  display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1px',
+                  pointerEvents: 'none'
+                }}>
+                  <div style={{
+                    background: color, color: '#000',
+                    fontSize: '9px', fontWeight: '900',
+                    padding: '1px 5px', borderRadius: '3px',
+                    letterSpacing: '0.5px', whiteSpace: 'nowrap'
+                  }}>{tr.id}</div>
+                  <div style={{
+                    background: 'rgba(0,0,0,0.8)', color: '#fff',
+                    fontSize: '10px', fontWeight: 'bold',
+                    padding: '1px 4px', borderRadius: '3px', whiteSpace: 'nowrap'
+                  }}>↑ {aglMeters}m</div>
                 </div>
               </div>
             </Marker>
@@ -2366,7 +2719,19 @@ export default function App() {
             <span className="text-muted">{t.homeLocation}</span>
             <div className="flex-row" style={{ justifyContent: 'space-between' }}>
               <span style={{ fontSize: '0.85rem' }}>{selectedRadar.homeLocation[0].toFixed(5)}, {selectedRadar.homeLocation[1].toFixed(5)}</span>
-              <MapPin size={16} style={{ color: 'var(--accent-cyan)' }} />
+              <MapPin 
+                size={16} 
+                style={{ color: 'var(--accent-cyan)', cursor: 'pointer' }} 
+                onClick={() => {
+                  if (mapRef.current) {
+                    mapRef.current.flyTo({ 
+                      center: [selectedRadar.homeLocation[1], selectedRadar.homeLocation[0]], 
+                      zoom: 14, 
+                      duration: 1500 
+                    });
+                  }
+                }}
+              />
             </div>
             <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>{t.altLabel}: {selectedRadar.homeLocation[2]}m</span>
           </div>
@@ -2427,61 +2792,94 @@ export default function App() {
 
         {/* Right Panel */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', width: '320px', pointerEvents: 'none' }}>
-          {filteredDetections.length > 0 && (
-            <div className="glass-panel" style={{ pointerEvents: 'auto', maxHeight: '40vh', overflowY: 'auto' }}>
-              <h3 style={{ margin: '0 0 1rem 0', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '1.1rem' }}>
-                <List size={18} /> {t.activeDetections} ({filteredDetections.length})
-              </h3>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                {(() => {
-                  const sortedDetections = [...filteredDetections].sort((a, b) => {
+          {(() => {
+            // Unified list: detections and/or tracks based on displayMode
+            const listItems: Array<{ id: string; speed: number; classification: 'drone'|'unknown'|'bird'; probUAV?: number; lat: number; lng: number; alt: number; heading: number; lastUpdated: number; radarId?: number; radarIds?: number[]; raw?: any; _isTrack?: boolean }> = [
+              ...(displayMode !== 'tracks' ? filteredDetections.map(d => ({ ...d, _isTrack: false })) : []),
+              ...(displayMode !== 'detections' ? filteredTracks.map(tr => ({ ...tr, radarId: tr.radarIds?.[0] ?? 0, _isTrack: true })) : [])
+            ];
+            const visibleCount = listItems.length;
+            if (visibleCount === 0) return null;
+
+            const sorted = [...listItems].sort((a, b) => {
+              if (defenseZones.length > 0) {
+                const scoreA = computeThreatScore(a as any, defenseZones, threatWeights).score;
+                const scoreB = computeThreatScore(b as any, defenseZones, threatWeights).score;
+                return scoreB - scoreA;
+              }
+              return 0;
+            });
+
+            const listTitle = displayMode === 'detections' ? `${t.activeDetections} (${visibleCount})`
+              : displayMode === 'tracks' ? `${t.activeTracks} (${visibleCount})`
+              : `${t.activeItems} (${visibleCount})`;
+
+            return (
+              <div className="glass-panel" style={{ pointerEvents: 'auto', maxHeight: '40vh', overflowY: 'auto' }}>
+                <h3 style={{ margin: '0 0 1rem 0', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '1.1rem' }}>
+                  <List size={18} /> {listTitle}
+                </h3>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                  {sorted.map(item => {
+                    const isSelected = currentSelectedDetection?.id === item.id;
+                    const classification = getClassification(item as any);
+                    let color = 'var(--accent-orange)';
+                    let threatScorePct = 0;
                     if (defenseZones.length > 0) {
-                      const scoreA = computeThreatScore(a, defenseZones, threatWeights).score;
-                      const scoreB = computeThreatScore(b, defenseZones, threatWeights).score;
-                      return scoreB - scoreA; // descending order
+                      const { score } = computeThreatScore(item as any, defenseZones, threatWeights);
+                      color = getThreatColor(score);
+                      threatScorePct = Math.round(score * 100);
+                    } else {
+                      if (classification === 'drone') color = item._isTrack ? '#FF6B6B' : 'var(--accent-red)';
+                      else if (classification === 'bird') color = item._isTrack ? '#34D399' : '#10B981';
+                      else color = item._isTrack ? 'var(--accent-cyan)' : 'var(--accent-orange)';
                     }
-                    return 0; // retain original order if no defense zones
-                  });
 
-                  return sortedDetections.map(d => {
-                  const isSelected = currentSelectedDetection?.id === d.id;
-                  const classification = getClassification(d);
-                  
-                  let color = 'var(--accent-orange)';
-                  let threatScorePct = 0;
-                  if (defenseZones.length > 0) {
-                    const { score } = computeThreatScore(d, defenseZones, threatWeights);
-                    color = getThreatColor(score);
-                    threatScorePct = Math.round(score * 100);
-                  } else {
-                    if (classification === 'drone') color = 'var(--accent-red)';
-                    else if (classification === 'bird') color = '#10B981';
-                  }
-
-                  return (
-                    <div key={d.id} onClick={() => setSelectedDetection(d)} style={{ padding: '0.5rem', background: isSelected ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.3)', border: `1px solid ${isSelected ? color : 'rgba(255,255,255,0.1)'}`, borderRadius: '4px', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0, flex: 1 }}>
-                        <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: color, flexShrink: 0 }} />
-                        <span style={{ fontWeight: 'bold', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.id}</span>
-                        <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', flexShrink: 0 }}>
-                          ({classification === 'drone' ? t.uav : (classification === 'bird' ? t.bird : t.unknown)})
-                        </span>
-                      </div>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
-                        {defenseZones.length > 0 && (
-                          <span style={{ fontSize: '0.8rem', fontWeight: 'bold', color, background: 'rgba(0,0,0,0.4)', padding: '2px 6px', borderRadius: '4px' }}>
-                            {threatScorePct}%
+                    return (
+                      <div key={item.id}
+                        onClick={() => setSelectedDetection(item as any)}
+                        style={{
+                          padding: '0.5rem',
+                          background: isSelected ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.3)',
+                          border: `1px solid ${isSelected ? color : 'rgba(255,255,255,0.1)'}`,
+                          borderRadius: '4px', cursor: 'pointer',
+                          display: 'flex', justifyContent: 'space-between', alignItems: 'center'
+                        }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0, flex: 1 }}>
+                          <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: color, flexShrink: 0 }} />
+                          {item._isTrack && (
+                            <span style={{
+                              fontSize: '0.65rem', fontWeight: '900', padding: '1px 4px',
+                              borderRadius: '3px', background: color, color: '#000',
+                              flexShrink: 0, letterSpacing: '0.3px'
+                            }}>TRK</span>
+                          )}
+                          <span style={{ fontWeight: 'bold', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '0.85rem' }}>{item.id}</span>
+                          <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', flexShrink: 0 }}>
+                            ({classification === 'drone' ? t.uav : (classification === 'bird' ? t.bird : t.unknown)})
                           </span>
-                        )}
-                        <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>{d.speed.toFixed(0)}m/s</span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+                          {item._isTrack && (item as any).radarIds?.length > 1 && (
+                            <span style={{ fontSize: '0.7rem', color: color, background: 'rgba(0,229,255,0.1)', padding: '1px 5px', borderRadius: '3px', fontWeight: 'bold' }}>
+                              {(item as any).radarIds.length} {t.radarsLabel}
+                            </span>
+                          )}
+                          {defenseZones.length > 0 && (
+                            <span style={{ fontSize: '0.8rem', fontWeight: 'bold', color, background: 'rgba(0,0,0,0.4)', padding: '2px 6px', borderRadius: '4px' }}>
+                              {threatScorePct}%
+                            </span>
+                          )}
+                          <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>{item.speed.toFixed(0)}m/s</span>
+                        </div>
                       </div>
-                    </div>
-                  );
-                });
-              })()}
+                    );
+                  })}
+                </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           {currentSelectedDetection && (() => {
             const classification = getClassification(currentSelectedDetection);
@@ -3182,6 +3580,123 @@ export default function App() {
               >
                 {t.drawDefenseZone}
               </button>
+            </div>
+
+            {/* ── Fusion Engine Section ── */}
+            <div className="flex-col" style={{ gap: '1.25rem', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '1.5rem' }}>
+              <h3 style={{ margin: 0, fontSize: '1.1rem', color: '#fff', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <Activity size={18} color="var(--accent-cyan)" /> {t.fusionTitle}
+              </h3>
+
+              {/* Display Mode selector */}
+              <div className="flex-col" style={{ gap: '0.5rem' }}>
+                <span style={{ fontSize: '0.85rem' }} className="text-muted">{t.displayModeLabel}</span>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '6px' }}>
+                  {(['detections', 'tracks', 'both'] as const).map(mode => (
+                    <button key={mode}
+                      onClick={() => setDisplayMode(mode)}
+                      style={{
+                        padding: '0.45rem 0.3rem',
+                        borderRadius: '6px',
+                        border: `1.5px solid ${displayMode === mode ? 'var(--accent-cyan)' : 'rgba(255,255,255,0.15)'}`,
+                        background: displayMode === mode ? 'rgba(0,229,255,0.15)' : 'rgba(0,0,0,0.3)',
+                        color: displayMode === mode ? 'var(--accent-cyan)' : 'var(--text-secondary)',
+                        fontWeight: displayMode === mode ? 'bold' : 'normal',
+                        fontSize: '0.75rem',
+                        cursor: 'pointer',
+                        transition: 'all 0.15s',
+                        textAlign: 'center'
+                      }}
+                    >
+                      {mode === 'detections' ? t.modeDetections : mode === 'tracks' ? t.modeTracks : t.modeBoth}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Fusion parameters */}
+              <div className="flex-col" style={{ gap: '0.75rem' }}>
+                <span style={{ fontSize: '0.85rem' }} className="text-muted">{t.fusionParamsLabel}</span>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
+                  {([
+                    { key: 'maxAssocDistM',       label: t.maxDistLabel,        type: 'number', min: 10,  max: 1000 },
+                    { key: 'maxAssocTimeSec',     label: t.maxTimeLabel,        type: 'number', min: 1,   max: 60 },
+                    { key: 'minDetectionsToConfirm', label: t.minConfirmLabel, type: 'number', min: 1,   max: 10 },
+                    { key: 'maxHeadingDiffDeg',   label: t.maxHeadingLabel,     type: 'number', min: 10,  max: 180 },
+                    { key: 'maxSpeedRatioFactor', label: t.maxSpeedRatioLabel,  type: 'number', min: 1.1, max: 10,  step: 0.1 },
+                    { key: 'wPosition',           label: t.wPositionLabel,      type: 'number', min: 0,   max: 1,   step: 0.1 },
+                    { key: 'wVelocity',           label: t.wVelocityLabel,      type: 'number', min: 0,   max: 1,   step: 0.1 },
+                  ] as Array<{ key: string; label: string; type: string; min?: number; max?: number; step?: number }>).map(param => (
+                    <div key={param.key} className="flex-col" style={{ gap: '2px' }}>
+                      <label style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>{param.label}</label>
+                      <input
+                        type="number"
+                        className="config-input"
+                        min={param.min}
+                        max={param.max}
+                        step={param.step ?? 1}
+                        defaultValue={(fusionConfigState as any)[param.key]}
+                        onBlur={async (e) => {
+                          const val = param.step && param.step < 1 ? parseFloat(e.target.value) : parseInt(e.target.value, 10);
+                          if (!isNaN(val)) {
+                            const body: any = {};
+                            body[param.key] = val;
+                            await fetch('/api/fusion/config', {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify(body)
+                            });
+                            setFusionConfigState((prev: any) => ({ ...prev, [param.key]: val }));
+                          }
+                        }}
+                        style={{ fontSize: '0.85rem', padding: '0.25rem 0.5rem', textAlign: 'center' }}
+                      />
+                    </div>
+                  ))}
+                </div>
+
+                {/* Cross-radar toggle */}
+                <label style={{ display: 'flex', alignItems: 'center', gap: '10px', color: '#fff', cursor: 'pointer', fontSize: '0.85rem' }}>
+                  <input
+                    type="checkbox"
+                    checked={(fusionConfigState as any).crossRadarFusion ?? true}
+                    onChange={async (e) => {
+                      const val = e.target.checked;
+                      await fetch('/api/fusion/config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ crossRadarFusion: val })
+                      });
+                      setFusionConfigState((prev: any) => ({ ...prev, crossRadarFusion: val }));
+                    }}
+                    style={{ width: '1.1rem', height: '1.1rem', accentColor: 'var(--accent-cyan)' }}
+                  />
+                  {t.crossRadarLabel}
+                </label>
+
+                {/* Classification fusion mode */}
+                <div className="flex-col" style={{ gap: '4px' }}>
+                  <label style={{ fontSize: '0.75rem' }} className="text-muted">{t.classFusionModeLabel}</label>
+                  <select
+                    className="config-input"
+                    defaultValue={(fusionConfigState as any).classificationFusionMode ?? 'max_prob'}
+                    onChange={async (e) => {
+                      const val = e.target.value;
+                      await fetch('/api/fusion/config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ classificationFusionMode: val })
+                      });
+                      setFusionConfigState((prev: any) => ({ ...prev, classificationFusionMode: val }));
+                    }}
+                    style={{ background: 'rgba(0,0,0,0.5)', color: '#fff', border: '1px solid rgba(255,255,255,0.2)', padding: '0.3rem', borderRadius: '4px', fontSize: '0.85rem' }}
+                  >
+                    <option value="max_prob">{lang === 'he' ? 'הסתברות מקסימלית (max_prob)' : 'Max Probability (max_prob)'}</option>
+                    <option value="majority">{lang === 'he' ? 'רוב קולות (majority)' : 'Majority Vote (majority)'}</option>
+                    <option value="latest">{lang === 'he' ? 'הדיווח האחרון (latest)' : 'Latest Detection (latest)'}</option>
+                  </select>
+                </div>
+              </div>
             </div>
 
             <button className="glowing-btn active" onClick={() => setShowAdminModal(false)} style={{ marginTop: '0.5rem' }}>
