@@ -525,7 +525,10 @@ export default function App() {
     maxSpeedRatioLabel: lang === 'he' ? 'יחס מהירות מקסימלי' : 'Max Speed Ratio',
     wPositionLabel: lang === 'he' ? 'משקל מיקום בעלות' : 'Position Weight in Cost',
     wVelocityLabel: lang === 'he' ? 'משקל מהירות בעלות' : 'Velocity Weight in Cost',
+    kalmanQLabel:   lang === 'he' ? 'מהירות תגובה לתמרונים (Q)' : 'Maneuver Responsiveness (Q)',
+    kalmanRLabel:   lang === 'he' ? 'עוצמת החלקה ויציבות (R)' : 'Smoothing & Stability (R)',
     crossRadarLabel: lang === 'he' ? 'קורלציה בין מכ"מים' : 'Cross-Radar Fusion',
+    kinematicClassLabel: lang === 'he' ? 'דרוס סיווג מכ"ם ע"פ חוק קינמטי (לא מומלץ)' : 'Override Radar AI with Kinematic Heuristics',
     classFusionModeLabel: lang === 'he' ? 'שיטת מיזוג סיווג' : 'Classification Fusion Mode',
     trackLabel:     lang === 'he' ? 'Track' : 'Track',
     radarsLabel:    lang === 'he' ? 'מכ"מים' : 'radars',
@@ -904,9 +907,10 @@ export default function App() {
 
   // fusionConfigState: mirrors backend fusionConfig for the admin UI inputs
   const [fusionConfigState, setFusionConfigState] = useState<any>({
-    maxAssocDistM: 150, maxAssocTimeSec: 10, minDetectionsToConfirm: 2,
+    maxAssocDistM: 15, maxAssocTimeSec: 10, minDetectionsToConfirm: 2,
     classificationFusionMode: 'max_prob', crossRadarFusion: true,
-    maxHeadingDiffDeg: 60, maxSpeedRatioFactor: 2.5, wPosition: 0.6, wVelocity: 0.4
+    maxHeadingDiffDeg: 60, maxSpeedRatioFactor: 2.5, wPosition: 0.6, wVelocity: 0.4,
+    enableKinematicClassification: false
   });
   useEffect(() => {
     fetch('/api/fusion/config')
@@ -931,19 +935,105 @@ export default function App() {
 
     setDetections(prev => {
       const filtered = prev.filter(p => p.id !== newDet.id);
-      const newDetections = [...filtered, newDet];
-      console.log(`[DEBUG] Detections updated. Total: ${newDetections.length}, Added: ${newDet.id}`);
-      return newDetections;
+      return [...filtered, newDet];
     });
 
     setTrackHistory(prev => {
       const existing = prev[newDet.id] || [];
       const updated = [...existing, { pos: [newDet.lng, newDet.lat] as [number, number], time: Date.now() }];
-      // Keep only last 60 seconds maximum in memory to prevent memory leaks
       const cutoff = Date.now() - 60000;
       return { ...prev, [newDet.id]: updated.filter(p => p.time > cutoff) };
     });
   }, [ignoredDetections]);
+
+  // ─── processBatch: High-performance ingestion for grouped websocket messages ───
+  const processBatch = useCallback((batch: any[]) => {
+    const newDets: Detection[] = [];
+    const newTracks: FusedTrack[] = [];
+    const newImus: Record<number, any> = {};
+    const now = Date.now();
+
+    for (const msg of batch) {
+      if (msg.type === 'imu') {
+        const rid = typeof msg.radarId === 'number' ? msg.radarId : parseInt(msg.radarId, 10);
+        newImus[rid] = { pitch: msg.pitch, roll: msg.roll, yaw: msg.yaw };
+      } else if (msg.type === 'track' && msg.id) {
+        if (!ignoredTracks.has(msg.id)) {
+          newTracks.push(msg as FusedTrack);
+        }
+      } else if (msg.id) {
+        if (!ignoredDetections.has(msg.id)) {
+          let keep = true;
+          if (filterOutsideFovRef.current && msg.raw && msg.radarId) {
+            const radar = radarsRef.current.find(r => r.id === msg.radarId);
+            if (radar) {
+              const az = msg.raw.relativeAzimuth_deg;
+              const el = msg.raw.relativeElevation_deg;
+              if (az < radar.azFovMin || az > radar.azFovMax || el < radar.elFovMin || el > radar.elFovMax) keep = false;
+            }
+          }
+          if (keep) {
+            newDets.push({
+              ...msg,
+              classification: msg.type === 'drone' ? 'drone' : 'unknown',
+              probUAV: msg.probUAV,
+              lastUpdated: now
+            });
+          }
+        }
+      }
+    }
+
+    if (Object.keys(newImus).length > 0) {
+      setLiveImuData(prev => ({ ...prev, ...newImus }));
+    }
+
+    if (newTracks.length > 0) {
+      setTracks(prev => {
+        const obj: Record<string, FusedTrack> = {};
+        prev.forEach(t => obj[t.id] = t);
+        newTracks.forEach(t => obj[t.id] = t);
+        return Object.values(obj);
+      });
+      setTrackHistory_fused(prev => {
+        const next = { ...prev };
+        const cutoff = now - 60000;
+        newTracks.forEach(t => {
+          const existing = next[t.id] || [];
+          const lastPoint = existing[existing.length - 1];
+          if (!lastPoint || lastPoint.pos[0] !== t.lng || lastPoint.pos[1] !== t.lat) {
+            next[t.id] = [...existing, { pos: [t.lng, t.lat] as [number, number], time: now }].filter(p => p.time > cutoff);
+          } else {
+            next[t.id] = existing.filter(p => p.time > cutoff);
+          }
+        });
+        return next;
+      });
+    }
+
+    if (newDets.length > 0) {
+      setDetections(prev => {
+        const obj: Record<string, Detection> = {};
+        prev.forEach(d => obj[d.id] = d);
+        newDets.forEach(d => obj[d.id] = d);
+        return Object.values(obj);
+      });
+      setTrackHistory(prev => {
+        const next = { ...prev };
+        const cutoff = now - 60000;
+        newDets.forEach(d => {
+          const existing = next[d.id] || [];
+          const lastPoint = existing[existing.length - 1];
+          if (!lastPoint || lastPoint.pos[0] !== d.lng || lastPoint.pos[1] !== d.lat) {
+            next[d.id] = [...existing, { pos: [d.lng, d.lat] as [number, number], time: now }].filter(p => p.time > cutoff);
+          } else {
+            next[d.id] = existing.filter(p => p.time > cutoff);
+          }
+        });
+        return next;
+      });
+    }
+  }, [ignoredDetections, ignoredTracks]);
 
   // WebSocket Connection for Live Mode
   const wsRef = useRef<WebSocket | null>(null);
@@ -1005,31 +1095,23 @@ export default function App() {
             return;
           }
 
+          // Handle batched payload
+          if (data.type === 'batch' && Array.isArray(data.data)) {
+            processBatch(data.data);
+            return;
+          }
+
+          // Legacy single messages
           if (data.type === 'imu') {
-            const rid = typeof data.radarId === 'number' ? data.radarId : parseInt(data.radarId, 10);
-            setLiveImuData(prev => ({
-              ...prev,
-              [rid]: { pitch: data.pitch, roll: data.roll, yaw: data.yaw }
-            }));
+            processBatch([data]);
             return;
           }
-
-          // Track/detection data from daemon
           if (data.type === 'track' && data.id) {
-            // Fused track from backend fusion engine
-            processNewTrack(data as FusedTrack);
+            processBatch([data]);
             return;
           }
-
           if (data.id) {
-            const rid = data.radarId != null ? (typeof data.radarId === 'number' ? data.radarId : parseInt(data.radarId, 10)) : selectedRadarId;
-            processNewDetection({
-              ...data,
-              classification: data.type === 'drone' ? 'drone' : 'unknown',
-              probUAV: data.probUAV,
-              lastUpdated: Date.now(),
-              radarId: rid
-            });
+            processBatch([data]);
           }
         } catch(e) {}
       };
@@ -1561,14 +1643,19 @@ export default function App() {
       Object.keys(next).forEach(k => {
         if (!activeTrackIds.has(k)) delete next[k];
       });
-      // Append current position for each active track
+      // Append current position for each active track only if it moved
       mappedTracks.forEach(t => {
         const existing = next[t.id] || [];
         const cutoff = Date.now() - 60000;
-        next[t.id] = [
-          ...existing.filter(p => p.time > cutoff),
-          { pos: [t.lng, t.lat] as [number, number], time: Date.now() }
-        ];
+        const lastPoint = existing[existing.length - 1];
+        if (!lastPoint || lastPoint.pos[0] !== t.lng || lastPoint.pos[1] !== t.lat) {
+          next[t.id] = [
+            ...existing.filter(p => p.time > cutoff),
+            { pos: [t.lng, t.lat] as [number, number], time: Date.now() }
+          ];
+        } else {
+          next[t.id] = existing.filter(p => p.time > cutoff);
+        }
       });
       return next;
     });
@@ -1749,8 +1836,7 @@ export default function App() {
     
     const sourceRadar = radars.find(r => r.id === d.radarId) || selectedRadar;
     const agl = d.alt - (sourceRadar.homeLocation[2] || 0);
-
-    if (!reason && classification !== 'drone' && (agl < filters.minAgl || agl > filters.maxAgl)) {
+    if (!reason && classification !== 'drone' && classification !== 'bird' && (agl < filters.minAgl || agl > filters.maxAgl)) {
       reason = `agl ${agl} out of bounds (${filters.minAgl}-${filters.maxAgl})`;
     }
 
@@ -1784,7 +1870,7 @@ export default function App() {
     if (classification === 'bird' && !filters.showBird) return false;
     if (tr.speed < filters.minSpeed || tr.speed > filters.maxSpeed) return false;
     const agl = tr.alt - (selectedRadar.homeLocation[2] || 0);
-    if (classification !== 'drone' && (agl < filters.minAgl || agl > filters.maxAgl)) return false;
+    if (classification !== 'drone' && classification !== 'bird' && (agl < filters.minAgl || agl > filters.maxAgl)) return false;
     const pt = turf.point([tr.lng, tr.lat]);
     for (const zone of ignoreZones) {
       if (agl >= zone.minAgl && agl <= zone.maxAgl) {
@@ -2217,6 +2303,7 @@ export default function App() {
                 style={{
                   display: 'flex', flexDirection: 'column', alignItems: 'center',
                   transform: `rotate(${tr.heading}deg) ${isSelected ? 'scale(1.25)' : 'scale(1)'}`,
+                  opacity: (tr as any).isPrediction ? 0.5 : 1,
                   transition: 'all 0.2s', cursor: 'pointer'
                 }}
               >
@@ -2225,7 +2312,7 @@ export default function App() {
                   {/* Outer ring */}
                   <div style={{
                     position: 'absolute', width: 40, height: 40, borderRadius: '50%',
-                    border: `2px solid ${color}`, opacity: 0.5,
+                    border: (tr as any).isPrediction ? `2px dashed ${color}` : `2px solid ${color}`, opacity: 0.5,
                     boxShadow: `0 0 8px ${color}55`
                   }} />
                   {/* Inner icon */}
@@ -2482,6 +2569,7 @@ export default function App() {
       <div className="top-bar glass-panel" style={{ position: 'absolute', top: '1rem', left: '50%', transform: 'translateX(-50%)', zIndex: 1000, display: 'flex', alignItems: 'center' }}>
         <Radar className="text-muted" />
         <h3 style={{ margin: 0, marginLeft: '10px', letterSpacing: '1px', fontWeight: 800 }}>MITZPE METZODA</h3>
+        <span style={{ marginLeft: '10px', fontSize: '0.7rem', color: 'var(--accent-cyan)', border: '1px solid var(--accent-cyan)', padding: '2px 4px', borderRadius: '4px', fontWeight: 'bold' }}>v1.2.12</span>
         <div style={{ width: '1px', height: '24px', background: 'rgba(255,255,255,0.2)', margin: '0 1rem' }} />
         
         <button className={`glowing-btn ${masterPowerActive ? 'active' : ''}`} onClick={handleMasterPower} style={{ padding: '0.25rem 0.75rem', borderRadius: '4px', fontSize: '0.85rem', display: 'flex', alignItems: 'center' }}>
@@ -3655,6 +3743,55 @@ export default function App() {
                   ))}
                 </div>
 
+                {/* Advanced Kalman Sliders */}
+                <div className="flex-col" style={{ gap: '0.75rem', marginTop: '0.5rem', padding: '0.5rem', border: '1px solid var(--border)', borderRadius: '4px' }}>
+                  <span style={{ fontSize: '0.85rem' }} className="text-muted">אפשרויות החלקה מתקדמות</span>
+                  
+                  {/* Kalman R Slider */}
+                  <div className="flex-col" style={{ gap: '2px' }}>
+                    <label style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>{t.kalmanRLabel}</label>
+                    <input 
+                      type="range" 
+                      min="0" max="100" 
+                      defaultValue={Math.round(100 * (Math.log10((fusionConfigState as any).kalmanR || 1e-5) - (-7)) / (-2 - (-7)))}
+                      onChange={async (e) => {
+                        const val = parseInt(e.target.value, 10);
+                        const expMin = -7; const expMax = -2;
+                        const rVal = Math.pow(10, expMin + (val / 100) * (expMax - expMin));
+                        await fetch('/api/fusion/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kalmanR: rVal }) });
+                        setFusionConfigState((prev: any) => ({ ...prev, kalmanR: rVal }));
+                      }}
+                      style={{ width: '100%', accentColor: 'var(--accent-cyan)', cursor: 'pointer' }}
+                    />
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.65rem', color: '#888' }}>
+                      <span>דיוק מרבי (קופצני)</span>
+                      <span>החלקה מרבית (יציב)</span>
+                    </div>
+                  </div>
+
+                  {/* Kalman Q Slider */}
+                  <div className="flex-col" style={{ gap: '2px' }}>
+                    <label style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>{t.kalmanQLabel}</label>
+                    <input 
+                      type="range" 
+                      min="0" max="100" 
+                      defaultValue={Math.round(100 * (Math.log10((fusionConfigState as any).kalmanQ || 1e-7) - (-9)) / (-3 - (-9)))}
+                      onChange={async (e) => {
+                        const val = parseInt(e.target.value, 10);
+                        const expMin = -9; const expMax = -3;
+                        const qVal = Math.pow(10, expMin + (val / 100) * (expMax - expMin));
+                        await fetch('/api/fusion/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kalmanQ: qVal }) });
+                        setFusionConfigState((prev: any) => ({ ...prev, kalmanQ: qVal }));
+                      }}
+                      style={{ width: '100%', accentColor: 'var(--accent-cyan)', cursor: 'pointer' }}
+                    />
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.65rem', color: '#888' }}>
+                      <span>תנועה חלקה ואחידה</span>
+                      <span>מגיב מהר לפניות חדות</span>
+                    </div>
+                  </div>
+                </div>
+
                 {/* Cross-radar toggle */}
                 <label style={{ display: 'flex', alignItems: 'center', gap: '10px', color: '#fff', cursor: 'pointer', fontSize: '0.85rem' }}>
                   <input
@@ -3672,6 +3809,25 @@ export default function App() {
                     style={{ width: '1.1rem', height: '1.1rem', accentColor: 'var(--accent-cyan)' }}
                   />
                   {t.crossRadarLabel}
+                </label>
+
+                {/* Kinematic Classification override toggle */}
+                <label style={{ display: 'flex', alignItems: 'center', gap: '10px', color: '#fff', cursor: 'pointer', fontSize: '0.85rem', marginTop: '4px' }}>
+                  <input
+                    type="checkbox"
+                    checked={(fusionConfigState as any).enableKinematicClassification ?? false}
+                    onChange={async (e) => {
+                      const val = e.target.checked;
+                      await fetch('/api/fusion/config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ enableKinematicClassification: val })
+                      });
+                      setFusionConfigState((prev: any) => ({ ...prev, enableKinematicClassification: val }));
+                    }}
+                    style={{ width: '1.1rem', height: '1.1rem', accentColor: 'var(--accent-cyan)' }}
+                  />
+                  {t.kinematicClassLabel}
                 </label>
 
                 {/* Classification fusion mode */}

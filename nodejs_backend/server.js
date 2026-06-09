@@ -71,6 +71,7 @@ app.get('/api/recordings/download_fused/:filename', (req, res) => {
   const offlineFusionEngine = createFusionEngine();
   
   const outputLines = [];
+  let lastCleanupTime = 0;
   
   lines.forEach(line => {
     outputLines.push(line); // original detection/imu packet
@@ -85,7 +86,17 @@ app.get('/api/recordings/download_fused/:filename', (req, res) => {
             timestamp: entry.timestamp, 
             packet: { type: 'track', ...track } 
           }));
+        }, entry.timestamp);
+      }
+      if (entry.timestamp - lastCleanupTime >= 1000) {
+        offlineFusionEngine.emitPredictions(entry.timestamp, (track) => {
+          outputLines.push(JSON.stringify({ 
+            timestamp: entry.timestamp, 
+            packet: { type: 'track', ...track } 
+          }));
         });
+        offlineFusionEngine.cleanup(entry.timestamp);
+        lastCleanupTime = entry.timestamp;
       }
     } catch(e) {
       // Ignore parse errors on corrupted lines
@@ -235,7 +246,7 @@ let activeWs = null; // track the currently active frontend WebSocket
 // ─────────────────────────────────────────────────────────────
 
 let fusionConfig = {
-  maxAssocDistM: 150,        // max positional gate (meters, after kinematic prediction)
+  maxAssocDistM: 15,         // max positional gate (meters, after kinematic prediction)
   maxAssocTimeSec: 10,       // max seconds a track lives without an update
   minDetectionsToConfirm: 2, // N-of-M confirmation before track is broadcast
   classificationFusionMode: 'max_prob', // 'max_prob' | 'majority' | 'latest'
@@ -245,7 +256,8 @@ let fusionConfig = {
   wPosition: 0.6,            // weight of position component in combined cost
   wVelocity: 0.4,            // weight of velocity component in combined cost
   kalmanQ: 1e-7,             // process noise variance (lower = smoother, slower to adapt)
-  kalmanR: 2e-8,             // measurement noise variance (lower = trust measurement more)
+  kalmanR: 1e-5,             // measurement noise variance (increased to handle GPS jitter and prevent velocity spikes)
+  enableKinematicClassification: false, // Override raw AI with kinematic heuristics?
 };
 
 function createFusionEngine() {
@@ -364,16 +376,28 @@ function createFusionEngine() {
   }
 
   function mergeProbUAV(track, detection, mode) {
-    const newProb = detection.probUAV !== undefined ? detection.probUAV :
-      (detection.classification === 'drone' ? 1.0 : detection.classification === 'bird' ? 0.05 : 0.5);
+    const radarConfig = radars && radars[detection.radarId];
+    const radarAlt = radarConfig && radarConfig.homeLocation ? (radarConfig.homeLocation[2] || 0) : 0;
+    const agl = (detection.alt || 0) - radarAlt;
+
+    let newProb;
+    if (agl < 30) {
+      // Aggressive rule (rely on AI heuristic) at low altitudes where clutter is high
+      newProb = detection.probUAV !== undefined ? detection.probUAV :
+        (detection.type === 'drone' ? 1.0 : detection.type === 'bird' ? 0.05 : 0.5);
+    } else {
+      // Pure radar classification at high altitudes
+      newProb = detection.type === 'drone' ? 1.0 : detection.type === 'bird' ? 0.05 : (detection.probUAV !== undefined ? detection.probUAV : 0.5);
+    }
+
     if (mode === 'max_prob') return Math.max(track.probUAV, newProb);
     else if (mode === 'latest') return newProb;
     else return 0.6 * track.probUAV + 0.4 * newProb;
   }
 
   return {
-    fuseDetection: (detection, emitTrackFn) => {
-      const now = detection.lastUpdated || Date.now();
+    fuseDetection: (detection, emitTrackFn, customTimestamp) => {
+      const now = customTimestamp !== undefined ? customTimestamp : Date.now();
       const cfg = fusionConfig;
 
       let bestTrack = null;
@@ -398,6 +422,16 @@ function createFusionEngine() {
         if (dtSec > cfg.maxAssocTimeSec) continue;
 
         if (!cfg.crossRadarFusion && detection.radarId !== track.primaryRadarId) continue;
+
+        // Prevent a single Fused Track from swallowing multiple targets from the SAME radar.
+        // If this track was updated by this radar very recently (< 5 seconds) with a DIFFERENT ID,
+        // it means the radar is simultaneously tracking two distinct physical objects.
+        const lastSeenFromThisRadar = track.lastSeenPerRadar && track.lastSeenPerRadar[detection.radarId];
+        if (lastSeenFromThisRadar && lastSeenFromThisRadar.id !== detection.id) {
+          if (now - lastSeenFromThisRadar.time < 5000) {
+            continue; // Reject kinematic association, force it to create its own track
+          }
+        }
 
         const predicted = predictPosition(track, dtSec);
         const distToPredicted = haversineDist(detection.lat, detection.lng, predicted.lat, predicted.lng);
@@ -424,6 +458,11 @@ function createFusionEngine() {
         const passesFallback = (distToLastKnown <= cfg.maxAssocDistM);
 
         if (!passesKinematic && !passesFallback) continue;
+        
+        // Stricter absolute distance check: Never associate if the absolute jump is completely unrealistic,
+        // even if the predicted point matched (which can happen with long maxAssocTimeSec and high speeds).
+        const maxAllowedAbsoluteJump = cfg.maxAssocDistM + (Math.max(detSpeed, trkSpeed, 10) * dtSec * 1.2);
+        if (distToLastKnown > maxAllowedAbsoluteJump) continue;
 
         let totalCost;
         if (passesKinematic) {
@@ -482,16 +521,21 @@ function createFusionEngine() {
         const kalmanHeading = (Math.atan2(vLngMs, vLatMs) * 180 / Math.PI + 360) % 360;
 
         if (kalmanSpeed >= 0.5) {
-          bestTrack.speed   = 0.7 * kalmanSpeed + 0.3 * (detection.speed || 0);
+          // Trust the radar's doppler speed as ground truth, but blend a tiny bit of kalman speed for smoothness.
+          // Cap the kalman speed contribution so a divergence doesn't ruin the track.
+          const safeKalmanSpeed = Math.min(kalmanSpeed, 100);
+          bestTrack.speed   = detection.speed !== undefined ? (0.1 * safeKalmanSpeed + 0.9 * detection.speed) : safeKalmanSpeed;
           bestTrack.heading = kalmanSpeed > 1 ? kalmanHeading : (detection.heading || bestTrack.heading);
         } else {
-          bestTrack.speed   = detection.speed || bestTrack.speed;
+          bestTrack.speed   = detection.speed !== undefined ? detection.speed : bestTrack.speed;
           bestTrack.heading = detection.heading !== undefined ? detection.heading : bestTrack.heading;
         }
 
         bestTrack.alt = 0.6 * (detection.alt || bestTrack.alt) + 0.4 * bestTrack.alt;
         bestTrack.probUAV = mergeProbUAV(bestTrack, detection, cfg.classificationFusionMode);
-        bestTrack.classification = bestTrack.probUAV > 0.5 ? 'drone' : (bestTrack.probUAV < 0.15 ? 'bird' : 'unknown');
+        // The frontend uses the uavThreshold slider to determine drone vs unknown based on probUAV.
+        // We only statically define 'bird' here for probabilities < 0.15.
+        bestTrack.classification = bestTrack.probUAV < 0.15 ? 'bird' : 'unknown';
         bestTrack.confidence = detection.confidence || bestTrack.confidence;
         bestTrack.lastUpdated = now;
         bestTrack.detectionCount += 1;
@@ -501,27 +545,37 @@ function createFusionEngine() {
         if (!bestTrack.radarIds.includes(detection.radarId)) {
           bestTrack.radarIds.push(detection.radarId);
         }
+        bestTrack.lastSeenPerRadar = bestTrack.lastSeenPerRadar || {};
+        bestTrack.lastSeenPerRadar[detection.radarId] = { id: detection.id, time: now };
         bestTrack.historyHeading = bestTrack.historyHeading || [];
         bestTrack.historySpeed = bestTrack.historySpeed || [];
+        bestTrack.historyAlt = bestTrack.historyAlt || [];
         bestTrack.historyHeading.push(kalmanHeading);
         bestTrack.historySpeed.push(kalmanSpeed);
+        bestTrack.historyAlt.push(bestTrack.alt);
         if (bestTrack.historyHeading.length > 30) bestTrack.historyHeading.shift();
         if (bestTrack.historySpeed.length > 30) bestTrack.historySpeed.shift();
+        if (bestTrack.historyAlt.length > 30) bestTrack.historyAlt.shift();
 
-        // Kinematic Classification Heuristic
-        if (bestTrack.historySpeed.length >= 20) {
+        // Kinematic Classification Heuristic (Optional)
+        if (cfg.enableKinematicClassification && bestTrack.historySpeed.length >= 20) {
            const avgS = bestTrack.historySpeed.reduce((a,b)=>a+b,0)/bestTrack.historySpeed.length;
            const varS = bestTrack.historySpeed.reduce((a,b)=>a+Math.pow(b-avgS,2),0)/bestTrack.historySpeed.length;
            const stdS = Math.sqrt(varS);
+           
+           const avgA = bestTrack.historyAlt.reduce((a,b)=>a+b,0)/bestTrack.historyAlt.length;
+           const varA = bestTrack.historyAlt.reduce((a,b)=>a+Math.pow(b-avgA,2),0)/bestTrack.historyAlt.length;
+           const stdA = Math.sqrt(varA);
+
            const rcs = (bestTrack.raw && bestTrack.raw.rcs !== undefined) ? bestTrack.raw.rcs : -999;
            
-           // If target maintains steady high speed and has drone-like RCS, boost its probability.
-           if (avgS >= 8 && stdS <= 3.5 && rcs >= -18) {
+           // If target maintains steady high speed, very stable altitude (unlike birds), and has drone-like RCS.
+           if (avgS >= 10 && stdS <= 3.0 && stdA <= 1.0 && rcs >= -18) {
                bestTrack.probUAV = Math.max(bestTrack.probUAV, 0.6); // Override to drone
            }
         }
 
-        bestTrack.classification = bestTrack.probUAV > 0.5 ? 'drone' : (bestTrack.probUAV < 0.15 ? 'bird' : 'unknown');
+        bestTrack.classification = bestTrack.probUAV < 0.15 ? 'bird' : 'unknown';
         bestTrack.raw = detection.raw || bestTrack.raw;
 
         if (!bestTrack.isConfirmed && bestTrack.detectionCount >= cfg.minDetectionsToConfirm) {
@@ -535,8 +589,19 @@ function createFusionEngine() {
       } else {
         trackCounter += 1;
         const trackId = `TRK-${String(trackCounter).padStart(4, '0')}`;
-        const initProb = detection.probUAV !== undefined ? detection.probUAV :
-          (detection.classification === 'drone' ? 1.0 : detection.classification === 'bird' ? 0.05 : 0.5);
+        
+        const radarConfig = radars && radars[detection.radarId];
+        const radarAlt = radarConfig && radarConfig.homeLocation ? (radarConfig.homeLocation[2] || 0) : 0;
+        const agl = (detection.alt || 0) - radarAlt;
+        
+        let initProb;
+        if (agl < 30) {
+          initProb = detection.probUAV !== undefined ? detection.probUAV :
+            (detection.type === 'drone' ? 1.0 : detection.type === 'bird' ? 0.05 : 0.5);
+        } else {
+          initProb = detection.type === 'drone' ? 1.0 : detection.type === 'bird' ? 0.05 : (detection.probUAV !== undefined ? detection.probUAV : 0.5);
+        }
+
         const newTrack = {
           id: trackId,
           primaryRadarId: detection.radarId,
@@ -557,6 +622,8 @@ function createFusionEngine() {
           raw: detection.raw,
           historyHeading: [detection.heading || 0],
           historySpeed: [detection.speed || 0],
+          historyAlt: [detection.alt || 0],
+          lastSeenPerRadar: { [detection.radarId]: { id: detection.id, time: now } },
           kalman: kalmanInit(detection.lat, detection.lng, detection.heading || 0, detection.speed || 0),
         };
         fusionTracks.set(trackId, newTrack);
@@ -569,6 +636,25 @@ function createFusionEngine() {
           fusionTracks.delete(trackId);
         }
       }
+    },
+    emitPredictions: (now, emitTrackFn) => {
+      for (const [trackId, track] of fusionTracks) {
+        if (!track.isConfirmed) continue;
+        const dtSec = (now - track.lastUpdated) / 1000;
+        // Only emit predictions if there's a gap of more than 500ms
+        if (dtSec > 0.5 && dtSec <= fusionConfig.maxAssocTimeSec) {
+          const { xPred, PPred } = kalmanPredict(track.kalman, dtSec, fusionConfig.kalmanQ);
+          const predictedTrack = {
+            ...track,
+            lat: xPred[0],
+            lng: xPred[1],
+            // keep the same speed and heading as last known, but mark as prediction
+            isPrediction: true,
+            predictionAgeSec: dtSec
+          };
+          emitTrackFn({ type: 'track', ...predictedTrack, kalman: undefined });
+        }
+      }
     }
   };
 }
@@ -576,14 +662,31 @@ function createFusionEngine() {
 // Live engine instance
 const liveFusionEngine = createFusionEngine();
 
+let wsBatch = [];
 setInterval(() => {
-  liveFusionEngine.cleanup(Date.now());
-}, 2000);
+  if (wsBatch.length > 0 && activeWs && activeWs.readyState === WebSocket.OPEN) {
+    activeWs.send(JSON.stringify({ type: 'batch', data: wsBatch }));
+    wsBatch = [];
+  }
+}, 50);
+
+setInterval(() => {
+  const now = Date.now();
+  liveFusionEngine.cleanup(now);
+  liveFusionEngine.emitPredictions(now, (data) => {
+    sendToFrontend(data);
+  });
+}, 500); // Check for predictions and cleanup twice a second
 
 // Safely send a message to the current active frontend WebSocket
 function sendToFrontend(data) {
-  if (activeWs && activeWs.readyState === WebSocket.OPEN) {
+  if (!activeWs || activeWs.readyState !== WebSocket.OPEN) return;
+  // Send important status messages immediately
+  if (data.type === 'status' || data.type === 'recordingStatus' || data.type === 'error') {
     activeWs.send(JSON.stringify(data));
+  } else {
+    // Batch high-frequency telemetry (detections, tracks, imu)
+    wsBatch.push(data);
   }
 }
 
@@ -768,6 +871,29 @@ function spawnDaemon(radar) {
           const latOffset = dNorth / metersPerLat;
           const lngOffset = dEast / metersPerLng;
 
+          // Calculate true global velocity vector using the same rotation matrices
+          const vx_local = -(msg.speedX || 0);
+          const vy_local = (msg.speedY || 0);
+          const vz_local = (msg.speedZ || 0);
+
+          // 1. Roll rotation
+          const vx1 = vx_local * cosR + vy_local * sinR;
+          const vy1 = -vx_local * sinR + vy_local * cosR;
+          const vz1 = vz_local;
+
+          // 2. Pitch rotation
+          const vx2 = vx1;
+          const vy2 = vy1 * cosP + vz1 * sinP;
+          const vz2 = -vy1 * sinP + vz1 * cosP;
+
+          // 3. Heading (Yaw) rotation
+          const vEast = vz2 * sinH + vx2 * cosH;
+          const vNorth = vz2 * cosH - vx2 * sinH;
+          const vZGlobal = vy2;
+
+          const globalSpeed = Math.sqrt(vEast*vEast + vNorth*vNorth + vZGlobal*vZGlobal);
+          const globalHeading = (Math.atan2(vEast, vNorth) * (180 / Math.PI) + 360) % 360;
+
           const detection = {
             id: `${msg.radarId}-${msg.id}`,
             radarId: parseInt(msg.radarId, 10),
@@ -776,8 +902,8 @@ function spawnDaemon(radar) {
             alt: radarConfig.homeLocation[2] + dz,
             type: msg.probUAV > 0.5 ? 'drone' : 'unknown',
             probUAV: msg.probUAV,
-            speed: Math.sqrt(msg.speedX**2 + msg.speedY**2 + msg.speedZ**2),
-            heading: Math.atan2(msg.speedY, msg.speedX) * (180 / Math.PI), // Note: relative heading, may also need rotation in future
+            speed: globalSpeed,
+            heading: globalHeading,
             confidence: msg.confidence,
             lastUpdated: Date.now(),
             raw: { 
