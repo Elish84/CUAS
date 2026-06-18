@@ -160,3 +160,12 @@ h1, h2, h3 {
 .leaflet-control-attribution {
   display: none;
 }
+
+@keyframes pulse-opacity {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1.0; }
+}
+
+.pulse-opacity {
+  animation: pulse-opacity 1.5s infinite ease-in-out;
+}

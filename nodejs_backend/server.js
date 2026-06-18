@@ -240,6 +240,148 @@ let radars = {}; // map of radarId -> radar config
 let daemonProcesses = {}; // map of radarId -> child_process
 let liveImuData = {}; // map of radarId -> { pitch, roll, yaw }
 let activeWs = null; // track the currently active frontend WebSocket
+let activeGpsReaders = {}; // map of serialPort -> child_process for GPS connection
+
+function manageGpsReader(radar) {
+  // If a specific radar was configured/turned on, mark its GPS as active
+  if (radar && radar.id) {
+    radars[radar.id].isGpsActive = true;
+  }
+
+  const desiredPorts = new Set();
+  const portToRadar = {};
+
+  Object.values(radars).forEach(r => {
+    if (r.gpsMode && r.gpsMode !== 'manual' && r.gpsSerialPort && r.isGpsActive !== false) {
+      desiredPorts.add(r.gpsSerialPort);
+      if (!portToRadar[r.gpsSerialPort]) {
+        portToRadar[r.gpsSerialPort] = r;
+      }
+    }
+  });
+
+  // 1. Kill readers for ports no longer desired
+  Object.keys(activeGpsReaders).forEach(port => {
+    if (!desiredPorts.has(port)) {
+      console.log(`[GPS Manager] Stopping GPS reader on port ${port} (no active radars using it)`);
+      const child = activeGpsReaders[port];
+      try {
+        if (process.platform === 'win32') {
+          spawn('taskkill', ['/F', '/T', '/PID', child.pid.toString()]);
+        } else {
+          child.kill('SIGKILL');
+        }
+      } catch (e) {
+        try { child.kill(); } catch (err) {}
+      }
+      delete activeGpsReaders[port];
+    }
+  });
+
+  // 2. Start/ensure readers for desired ports
+  desiredPorts.forEach(port => {
+    if (!activeGpsReaders[port]) {
+      const sampleRadar = portToRadar[port];
+      const radarId = sampleRadar.id;
+      console.log(`[GPS Manager] Spawning GPS reader on ${port} (baud: ${sampleRadar.gpsBaudRate || 115200}, mode: ${sampleRadar.gpsMode})`);
+
+      const pyScript = path.join(__dirname, 'gps_reader.py');
+      const modeArg = sampleRadar.gpsMode === 'auto-stationary' ? 'stationary' : 'mobile';
+
+      try {
+        // Notify all radars sharing this port that we are connecting
+        const sharingRadars = Object.values(radars).filter(r => r.gpsSerialPort === port && r.isGpsActive !== false);
+        sharingRadars.forEach(r => {
+          sendToFrontend({ type: 'gpsStatus', radarId: r.id, state: 'connecting' });
+        });
+
+        const child = spawn('python', [
+          pyScript,
+          '--port', port,
+          '--baud', (sampleRadar.gpsBaudRate || 115200).toString(),
+          '--radar-id', radarId.toString(),
+          '--mode', modeArg
+        ]);
+
+        child.stdout.on('data', (data) => {
+          const lines = data.toString().split('\n');
+          lines.forEach(line => {
+            if (!line.trim()) return;
+            try {
+              const payload = JSON.parse(line.trim());
+              if (payload.error) {
+                console.error(`[GPS Reader Error on ${port}]: ${payload.error}`);
+                const currentSharing = Object.values(radars).filter(r => r.gpsSerialPort === port && r.isGpsActive !== false);
+                currentSharing.forEach(r => {
+                  sendToFrontend({ type: 'error', radarId: r.id, message: `GPS Error: ${payload.error}` });
+                  sendToFrontend({ type: 'gpsStatus', radarId: r.id, state: 'error', message: payload.error });
+                });
+                return;
+              }
+
+              // Distribute to all radars sharing this port
+              const currentSharing = Object.values(radars).filter(r => r.gpsMode && r.gpsMode !== 'manual' && r.gpsSerialPort === port && r.isGpsActive !== false);
+              currentSharing.forEach(currentRadar => {
+                const relYaw = currentRadar.relativeYaw || 0;
+                const rawHdg = payload.heading;
+                const trueHdg = (rawHdg + relYaw + 360) % 360;
+                currentRadar.heading = trueHdg;
+
+                if (payload.hasGpsFix && payload.lat !== null && payload.lng !== null) {
+                  currentRadar.homeLocation[0] = payload.lat;
+                  currentRadar.homeLocation[1] = payload.lng;
+                  currentRadar.homeLocation[2] = payload.alt;
+                  sendToFrontend({ type: 'gpsStatus', radarId: currentRadar.id, state: 'connected' });
+                } else {
+                  sendToFrontend({ type: 'gpsStatus', radarId: currentRadar.id, state: 'heading-only' });
+                }
+
+                // Broadcast heading + position update to frontend in real-time
+                sendToFrontend({ type: 'radarConfigUpdate', radar: currentRadar });
+              });
+
+              // Throttle console log to once every 5 seconds per port
+              const now = Date.now();
+              if (!child._lastLogTime || now - child._lastLogTime >= 5000) {
+                child._lastLogTime = now;
+                const fixStr = payload.hasGpsFix
+                  ? `GPS[${payload.lat?.toFixed(4)},${payload.lng?.toFixed(4)}]`
+                  : 'NO-FIX';
+                console.log(`[GPS Port ${port}] ${fixStr} Hdg (raw): ${payload.heading}°`);
+              }
+
+            } catch (e) {
+              console.error(`[GPS Reader ${port} Parse Error]:`, e.message, 'line:', line);
+            }
+          });
+        });
+
+        child.stderr.on('data', (data) => {
+          console.error(`[GPS Reader ${port} Stderr]: ${data.toString().trim()}`);
+        });
+
+        child.on('close', (code) => {
+          console.log(`[GPS Reader ${port}] Exited with code ${code}`);
+          if (activeGpsReaders[port] === child) {
+            delete activeGpsReaders[port];
+          }
+          const currentSharing = Object.values(radars).filter(r => r.gpsSerialPort === port);
+          currentSharing.forEach(r => {
+            sendToFrontend({ type: 'gpsStatus', radarId: r.id, state: 'disconnected' });
+          });
+        });
+
+        activeGpsReaders[port] = child;
+      } catch (err) {
+        console.error(`Failed to spawn GPS reader on ${port}: ${err.message}`);
+        const currentSharing = Object.values(radars).filter(r => r.gpsSerialPort === port);
+        currentSharing.forEach(r => {
+          sendToFrontend({ type: 'gpsStatus', radarId: r.id, state: 'error', message: err.message });
+        });
+      }
+    }
+  });
+}
 
 // ─────────────────────────────────────────────────────────────
 //  FUSION ENGINE — Motion-Aided Detection-to-Track Association
@@ -681,14 +823,43 @@ setInterval(() => {
 // Safely send a message to the current active frontend WebSocket
 function sendToFrontend(data) {
   if (!activeWs || activeWs.readyState !== WebSocket.OPEN) return;
-  // Send important status messages immediately
-  if (data.type === 'status' || data.type === 'recordingStatus' || data.type === 'error') {
+  // Send important status and config messages immediately
+  if (
+    data.type === 'status' || 
+    data.type === 'recordingStatus' || 
+    data.type === 'error' ||
+    data.type === 'gpsStatus' ||
+    data.type === 'radarConfigUpdate'
+  ) {
     activeWs.send(JSON.stringify(data));
   } else {
     // Batch high-frequency telemetry (detections, tracks, imu)
     wsBatch.push(data);
   }
 }
+
+// ── GPS Available Ports API Endpoint ────────────────────────
+app.get('/api/gps/ports', (req, res) => {
+  const pyProcess = spawn('python', [
+    '-c',
+    'import serial.tools.list_ports, json; print(json.dumps([p.device for p in serial.tools.list_ports.comports()]))'
+  ]);
+  
+  let output = '';
+  pyProcess.stdout.on('data', (data) => {
+    output += data.toString();
+  });
+  
+  pyProcess.on('close', (code) => {
+    try {
+      const ports = JSON.parse(output.trim());
+      res.json(ports);
+    } catch (e) {
+      console.error('Failed to parse COM ports output:', output);
+      res.json([]);
+    }
+  });
+});
 
 // ── Fusion config API endpoints ──────────────────────────────
 app.get('/api/fusion/config', (req, res) => {
@@ -1014,7 +1185,10 @@ wss.on('connection', (ws) => {
       if (command.action === 'configure') {
         // Store ALL radars by ID for later per-radar commands
         if (Array.isArray(command.radars)) {
-          command.radars.forEach(r => { radars[r.id] = r; });
+          command.radars.forEach(r => { 
+            radars[r.id] = r; 
+            manageGpsReader(r);
+          });
           console.log('Configured', Object.keys(radars).length, 'radars.');
         }
       } else if (command.action === 'turnOn') {
@@ -1025,6 +1199,10 @@ wss.on('connection', (ws) => {
         targets.forEach(radar => {
           console.log(`Turning ON radar ${radar.id} at ${radar.ip}`);
           sendToFrontend({ type: 'status', radarId: radar.id, state: 'connecting', message: `Connecting to radar ${radar.id}...` });
+          
+          // Trigger/ensure GPS reader is active
+          manageGpsReader(radar);
+
           spawnDaemon(radar);
           // If daemon was already running, spawnDaemon already sent 'connected'
           // If daemon is new, it will send stdout 'status' when connected
@@ -1040,6 +1218,11 @@ wss.on('connection', (ws) => {
         targets.forEach(radar => {
           console.log(`Turning OFF radar ${radar.id}`);
           killDaemon(radar.id);
+          
+          // Mark GPS as inactive for this radar and update GPS readers
+          radars[radar.id].isGpsActive = false;
+          manageGpsReader();
+
           sendToFrontend({ type: 'status', radarId: radar.id, state: 'off', message: `Radar ${radar.id} turned off` });
         });
       }

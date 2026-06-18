@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import Map, { Source, Layer, Marker, NavigationControl } from 'react-map-gl/maplibre';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { Power, Crosshair, MapPin, Activity, Settings, Radar, Sliders, Wifi, WifiOff, Filter, List, Focus, Trash2, ShieldAlert, Check, Play, Pause, Square, Circle } from 'lucide-react';
+import { Power, Crosshair, MapPin, Activity, Settings, Radar, Sliders, Wifi, WifiOff, Filter, List, Focus, Trash2, ShieldAlert, Check, Play, Pause, Square, Circle, ChevronLeft, ChevronRight } from 'lucide-react';
 import * as turf from '@turf/turf';
 import './index.css';
 
@@ -43,6 +43,10 @@ type RadarConfig = {
   maxRcs: number;
   maxRange: number; // meters
   clutterWidth?: number;
+  gpsMode?: 'manual' | 'auto-stationary' | 'auto-mobile';
+  gpsSerialPort?: string;
+  gpsBaudRate?: number;
+  relativeYaw?: number;
 };
 
 type Detection = {
@@ -245,10 +249,10 @@ export default function App() {
       }
     }
     return [
-      { id: 1, name: 'מכ"ם 1', ip: '192.168.1.100', isActive: false, homeLocation: [32.0853, 34.7818, 15], heading: 0, elevation: 0, pitch: 0, roll: 0, useImu: false, fadeThreshold: 5, freqChannel: 1, elFovMin: -40, elFovMax: 40, azFovMin: -60, azFovMax: 60, minRcs: -30, maxRcs: 10, maxRange: 2000, clutterWidth: 3 },
-      { id: 2, name: 'מכ"ם 2', ip: '192.168.1.101', isActive: false, homeLocation: [32.0883, 34.7818, 15], heading: 90, elevation: 0, pitch: 0, roll: 0, useImu: false, fadeThreshold: 5, freqChannel: 2, elFovMin: -40, elFovMax: 40, azFovMin: -60, azFovMax: 60, minRcs: -30, maxRcs: 10, maxRange: 2000, clutterWidth: 3 },
-      { id: 3, name: 'מכ"ם 3', ip: '192.168.1.102', isActive: false, homeLocation: [32.0883, 34.7858, 15], heading: 180, elevation: 0, pitch: 0, roll: 0, useImu: false, fadeThreshold: 5, freqChannel: 3, elFovMin: -40, elFovMax: 40, azFovMin: -60, azFovMax: 60, minRcs: -30, maxRcs: 10, maxRange: 2000, clutterWidth: 3 },
-      { id: 4, name: 'מכ"ם 4', ip: '192.168.1.103', isActive: false, homeLocation: [32.0853, 34.7858, 15], heading: 270, elevation: 0, pitch: 0, roll: 0, useImu: false, fadeThreshold: 5, freqChannel: 4, elFovMin: -40, elFovMax: 40, azFovMin: -60, azFovMax: 60, minRcs: -30, maxRcs: 10, maxRange: 2000, clutterWidth: 3 },
+      { id: 1, name: 'מכ"ם 1', ip: '192.168.1.100', isActive: false, homeLocation: [32.0853, 34.7818, 15], heading: 0, elevation: 0, pitch: 0, roll: 0, useImu: false, fadeThreshold: 5, freqChannel: 1, elFovMin: -40, elFovMax: 40, azFovMin: -60, azFovMax: 60, minRcs: -30, maxRcs: 10, maxRange: 2000, clutterWidth: 3, gpsMode: 'manual', gpsSerialPort: 'COM3', gpsBaudRate: 115200, relativeYaw: 0 },
+      { id: 2, name: 'מכ"ם 2', ip: '192.168.1.101', isActive: false, homeLocation: [32.0883, 34.7818, 15], heading: 90, elevation: 0, pitch: 0, roll: 0, useImu: false, fadeThreshold: 5, freqChannel: 2, elFovMin: -40, elFovMax: 40, azFovMin: -60, azFovMax: 60, minRcs: -30, maxRcs: 10, maxRange: 2000, clutterWidth: 3, gpsMode: 'manual', gpsSerialPort: 'COM3', gpsBaudRate: 115200, relativeYaw: 0 },
+      { id: 3, name: 'מכ"ם 3', ip: '192.168.1.102', isActive: false, homeLocation: [32.0883, 34.7858, 15], heading: 180, elevation: 0, pitch: 0, roll: 0, useImu: false, fadeThreshold: 5, freqChannel: 3, elFovMin: -40, elFovMax: 40, azFovMin: -60, azFovMax: 60, minRcs: -30, maxRcs: 10, maxRange: 2000, clutterWidth: 3, gpsMode: 'manual', gpsSerialPort: 'COM3', gpsBaudRate: 115200, relativeYaw: 0 },
+      { id: 4, name: 'מכ"ם 4', ip: '192.168.1.103', isActive: false, homeLocation: [32.0853, 34.7858, 15], heading: 270, elevation: 0, pitch: 0, roll: 0, useImu: false, fadeThreshold: 5, freqChannel: 4, elFovMin: -40, elFovMax: 40, azFovMin: -60, azFovMax: 60, minRcs: -30, maxRcs: 10, maxRange: 2000, clutterWidth: 3, gpsMode: 'manual', gpsSerialPort: 'COM3', gpsBaudRate: 115200, relativeYaw: 0 },
     ];
   });
   const [selectedRadarId, setSelectedRadarId] = useState<number>(1);
@@ -782,6 +786,21 @@ export default function App() {
     return saved ? parseInt(saved, 10) : 10;
   });
   const [showConfigModal, setShowConfigModal] = useState<boolean>(false);
+  const [availablePorts, setAvailablePorts] = useState<string[]>([]);
+  const [gpsStatuses, setGpsStatuses] = useState<Record<number, 'connecting' | 'connected' | 'heading-only' | 'error' | 'disconnected'>>({});
+
+  useEffect(() => {
+    if (showConfigModal) {
+      fetch('/api/gps/ports')
+        .then(res => res.json())
+        .then(data => {
+          if (Array.isArray(data)) {
+            setAvailablePorts(data);
+          }
+        })
+        .catch(err => console.error('Failed to fetch serial ports:', err));
+    }
+  }, [showConfigModal]);
   
   // Playback & Recording State
   const [playbackPackets, setPlaybackPackets] = useState<any[]>([]);
@@ -795,6 +814,7 @@ export default function App() {
   const [fileToRename, setFileToRename] = useState<{ oldName: string; defaultName: string } | null>(null);
   const [newFileNameInput, setNewFileNameInput] = useState<string>('');
   const [showFilterModal, setShowFilterModal] = useState<boolean>(false);
+  const [isLeftPanelCollapsed, setIsLeftPanelCollapsed] = useState<boolean>(false);
   const [mapType, setMapType] = useState<'dark' | 'satellite'>(() => {
     const saved = localStorage.getItem('mitzpe_metzoda_map_type');
     return saved ? JSON.parse(saved) : 'dark';
@@ -1087,6 +1107,15 @@ export default function App() {
               // Also mark radar as active in state since it's confirmed working
               setRadars(prev => prev.map(r => r.id === rid ? { ...r, isActive: true } : r));
             }
+            return;
+          }
+          if (data.type === 'radarConfigUpdate' && data.radar) {
+            setRadars(prev => prev.map(r => String(r.id) === String(data.radar.id) ? { ...r, ...data.radar } : r));
+            return;
+          }
+          if (data.type === 'gpsStatus' && data.radarId != null) {
+            const rid = typeof data.radarId === 'number' ? data.radarId : parseInt(data.radarId, 10);
+            setGpsStatuses(prev => ({ ...prev, [rid]: data.state }));
             return;
           }
           if (data.type === 'error' && data.radarId != null) {
@@ -1505,7 +1534,8 @@ export default function App() {
 
   const updateRadarConfig = (field: keyof RadarConfig, value: any) => {
     let parsedValue = value;
-    if (typeof value === 'string' && value !== '' && value !== '-') {
+    const stringFields: Array<keyof RadarConfig> = ['ip', 'name', 'gpsMode', 'gpsSerialPort'];
+    if (typeof value === 'string' && !stringFields.includes(field) && value !== '' && value !== '-') {
       const num = parseFloat(value);
       if (!isNaN(num)) {
         parsedValue = num;
@@ -2118,16 +2148,61 @@ export default function App() {
           </Source>
         )}
 
-        {/* Radar Markers */}
+        {/* Radar Markers — custom SVG that rotates with heading */}
         {radars.map(radar => (
           <Marker
             key={`radar-marker-${radar.id}`}
             longitude={radar.homeLocation[1]}
             latitude={radar.homeLocation[0]}
-            color="#4ade80"
             draggable={true}
             onDragEnd={(evt) => handleRadarDragEnd(radar.id, evt)}
-          />
+          >
+            {/* Outer container: fixed on screen, not rotated */}
+            <div
+              title={`${radar.name}\nHeading: ${radar.heading.toFixed(1)}°\n${radar.homeLocation[0].toFixed(5)}, ${radar.homeLocation[1].toFixed(5)}`}
+              style={{ cursor: 'pointer', position: 'relative', width: '36px', height: '36px' }}
+              onClick={() => setSelectedRadarId(radar.id)}
+            >
+              {/* Direction arrow — rotates with heading */}
+              <svg
+                width="36" height="36"
+                viewBox="0 0 36 36"
+                style={{
+                  position: 'absolute', top: 0, left: 0,
+                  transform: `rotate(${radar.heading}deg)`,
+                  transition: 'transform 0.5s ease',
+                  filter: radar.id === selectedRadarId
+                    ? `drop-shadow(0 0 6px ${getStatusColor(radar)})`
+                    : 'none'
+                }}
+              >
+                {/* Arrow pointing UP (North = 0°) — rotated by heading */}
+                <polygon
+                  points="18,4 23,20 18,17 13,20"
+                  fill={getStatusColor(radar)}
+                  opacity="0.9"
+                />
+                {/* Center dot */}
+                <circle cx="18" cy="18" r="5"
+                  fill={getStatusColor(radar)}
+                  stroke={radar.id === selectedRadarId ? '#fff' : 'transparent'}
+                  strokeWidth="1.5"
+                />
+              </svg>
+              {/* Radar ID label below */}
+              <span style={{
+                position: 'absolute',
+                bottom: '-14px',
+                left: '50%',
+                transform: 'translateX(-50%)',
+                fontSize: '0.6rem',
+                fontWeight: 'bold',
+                color: getStatusColor(radar),
+                whiteSpace: 'nowrap',
+                textShadow: '0 0 4px #000, 0 0 4px #000'
+              }}>{radar.name}</span>
+            </div>
+          </Marker>
         ))}
 
         {/* Saved Ignore Zones */}
@@ -2748,7 +2823,45 @@ export default function App() {
       <div className="side-panels" style={{ position: 'absolute', top: '80px', left: '1rem', right: '1rem', display: 'flex', justifyContent: 'space-between', zIndex: 1000, pointerEvents: 'none' }}>
         
         {/* Left Panel */}
-        <div className="left-panel glass-panel" style={{ pointerEvents: 'auto', width: '300px' }}>
+        <div 
+          className="left-panel glass-panel" 
+          style={{ 
+            pointerEvents: 'auto', 
+            width: '300px',
+            transform: isLeftPanelCollapsed ? 'translateX(calc(-100% - 1.5rem))' : 'translateX(0)',
+            transition: 'transform 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+            position: 'relative'
+          }}
+        >
+          {/* Collapse/Expand Toggle Button */}
+          <button
+            onClick={() => setIsLeftPanelCollapsed(!isLeftPanelCollapsed)}
+            style={{
+              position: 'absolute',
+              top: '50%',
+              right: '-24px',
+              transform: 'translateY(-50%)',
+              width: '24px',
+              height: '60px',
+              background: 'var(--panel-bg)',
+              backdropFilter: 'blur(12px)',
+              WebkitBackdropFilter: 'blur(12px)',
+              border: '1px solid rgba(255, 255, 255, 0.1)',
+              borderLeft: 'none',
+              borderRadius: '0 8px 8px 0',
+              color: 'var(--text-primary)',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              boxShadow: '4px 0 10px rgba(0, 0, 0, 0.3)',
+              transition: 'all 0.2s',
+              zIndex: 10
+            }}
+            title={isLeftPanelCollapsed ? (lang === 'he' ? 'הצג תפריט' : 'Show Panel') : (lang === 'he' ? 'הסתר תפריט' : 'Hide Panel')}
+          >
+            {isLeftPanelCollapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
+          </button>
           {appMode === 'playback' && (
             // Playback File Selector Dropdown at the top of the Left Panel
             <div className="flex-col" style={{ gap: '0.4rem', borderBottom: '1px solid rgba(255,255,255,0.15)', paddingBottom: '1rem', marginBottom: '0.75rem' }}>
@@ -2822,6 +2935,66 @@ export default function App() {
               />
             </div>
             <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>{t.altLabel}: {selectedRadar.homeLocation[2]}m</span>
+          </div>
+
+          {/* Real-time heading display */}
+          <div className="flex-col" style={{ gap: '4px' }}>
+            <span className="text-muted">{lang === 'he' ? 'כיוון מכ"ם' : 'Radar Heading'}</span>
+            <div className="flex-row" style={{ alignItems: 'center', gap: '8px' }}>
+              {/* Compass needle that rotates to show heading */}
+              <div style={{
+                width: '32px',
+                height: '32px',
+                borderRadius: '50%',
+                border: '2px solid var(--border-subtle)',
+                background: 'var(--bg-tertiary)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                flexShrink: 0,
+                position: 'relative',
+                overflow: 'hidden'
+              }}>
+                <div style={{
+                  width: '2px',
+                  height: '12px',
+                  background: 'var(--accent-cyan)',
+                  borderRadius: '1px',
+                  transformOrigin: 'center bottom',
+                  transform: `rotate(${selectedRadar.heading}deg)`,
+                  transition: 'transform 0.4s ease',
+                  position: 'absolute',
+                  bottom: '50%',
+                  left: 'calc(50% - 1px)',
+                  boxShadow: '0 0 4px var(--accent-cyan)'
+                }} />
+                <div style={{
+                  width: '4px',
+                  height: '4px',
+                  borderRadius: '50%',
+                  background: 'var(--accent-cyan)',
+                  position: 'absolute',
+                  zIndex: 1
+                }} />
+              </div>
+              <div className="flex-col" style={{ gap: '2px' }}>
+                <span style={{ fontSize: '1.1rem', fontWeight: 'bold', color: 'var(--accent-cyan)', fontFamily: 'monospace', lineHeight: 1 }}>
+                  {selectedRadar.heading.toFixed(1)}°
+                </span>
+                {/* GPS/heading source indicator */}
+                {selectedRadar.gpsMode && selectedRadar.gpsMode !== 'manual' && (
+                  <span style={{ fontSize: '0.68rem', color:
+                    gpsStatuses[selectedRadarId] === 'connected'    ? 'var(--accent-cyan)' :
+                    gpsStatuses[selectedRadarId] === 'heading-only' ? '#ff9800' :
+                    'var(--text-secondary)'
+                  }}>
+                    {gpsStatuses[selectedRadarId] === 'connected'    ? (lang === 'he' ? '🛰 GPS אוטומטי' : '🛰 Auto GPS') :
+                     gpsStatuses[selectedRadarId] === 'heading-only' ? (lang === 'he' ? '🧭 כיוון אוטומטי' : '🧭 Auto Heading') :
+                     (lang === 'he' ? '⏳ ממתין...' : '⏳ Waiting...')}
+                  </span>
+                )}
+              </div>
+            </div>
           </div>
 
           <div className="flex-col">
@@ -3312,22 +3485,23 @@ export default function App() {
                   {renderHelpButton('homeLocation')}
                 </label>
                 <div className="flex-row" style={{ gap: '0.5rem', direction: 'ltr', alignItems: 'center' }}>
-                  <input type="number" className="config-input" style={{ flex: 1 }} value={selectedRadar.homeLocation[0]} onChange={(e) => updateRadarConfig('homeLocation', [parseFloat(e.target.value), selectedRadar.homeLocation[1], selectedRadar.homeLocation[2]])} placeholder="Latitude" />
-                  <input type="number" className="config-input" style={{ flex: 1 }} value={selectedRadar.homeLocation[1]} onChange={(e) => updateRadarConfig('homeLocation', [selectedRadar.homeLocation[0], parseFloat(e.target.value), selectedRadar.homeLocation[2]])} placeholder="Longitude" />
-                  <input type="number" className="config-input" style={{ flex: 1 }} value={selectedRadar.homeLocation[2]} onChange={(e) => updateRadarConfig('homeLocation', [selectedRadar.homeLocation[0], selectedRadar.homeLocation[1], parseFloat(e.target.value)])} placeholder="Altitude ASL (m)" />
+                  <input type="number" disabled={selectedRadar.gpsMode && selectedRadar.gpsMode !== 'manual'} className="config-input" style={{ flex: 1 }} value={selectedRadar.homeLocation[0]} onChange={(e) => updateRadarConfig('homeLocation', [parseFloat(e.target.value), selectedRadar.homeLocation[1], selectedRadar.homeLocation[2]])} placeholder="Latitude" />
+                  <input type="number" disabled={selectedRadar.gpsMode && selectedRadar.gpsMode !== 'manual'} className="config-input" style={{ flex: 1 }} value={selectedRadar.homeLocation[1]} onChange={(e) => updateRadarConfig('homeLocation', [selectedRadar.homeLocation[0], parseFloat(e.target.value), selectedRadar.homeLocation[2]])} placeholder="Longitude" />
+                  <input type="number" disabled={selectedRadar.gpsMode && selectedRadar.gpsMode !== 'manual'} className="config-input" style={{ flex: 1 }} value={selectedRadar.homeLocation[2]} onChange={(e) => updateRadarConfig('homeLocation', [selectedRadar.homeLocation[0], selectedRadar.homeLocation[1], parseFloat(e.target.value)])} placeholder="Altitude ASL (m)" />
                   <button
                     type="button"
+                    disabled={selectedRadar.gpsMode && selectedRadar.gpsMode !== 'manual'}
                     onClick={() => {
                       setIsSelectingLocationFromMap(true);
                       setShowConfigModal(false);
                     }}
                     style={{
-                      background: 'var(--accent-cyan)',
-                      color: 'var(--bg-color)',
+                      background: selectedRadar.gpsMode && selectedRadar.gpsMode !== 'manual' ? '#555' : 'var(--accent-cyan)',
+                      color: selectedRadar.gpsMode && selectedRadar.gpsMode !== 'manual' ? '#888' : 'var(--bg-color)',
                       border: 'none',
                       borderRadius: '4px',
                       padding: '0.5rem 1rem',
-                      cursor: 'pointer',
+                      cursor: selectedRadar.gpsMode && selectedRadar.gpsMode !== 'manual' ? 'not-allowed' : 'pointer',
                       fontWeight: 'bold',
                       fontSize: '0.85rem',
                       whiteSpace: 'nowrap'
@@ -3336,6 +3510,11 @@ export default function App() {
                     {lang === 'he' ? 'בחר מהמפה' : 'Select from Map'}
                   </button>
                 </div>
+                {selectedRadar.gpsMode && selectedRadar.gpsMode !== 'manual' && (
+                  <span style={{ fontSize: '0.75rem', color: 'var(--accent-cyan)', marginTop: '4px' }}>
+                    {lang === 'he' ? '* המיקום מנוהל אוטומטית על ידי ה-GPS' : '* Location is automatically managed by GPS'}
+                  </span>
+                )}
               </div>
               {renderHelpText('homeLocation')}
 
@@ -3344,7 +3523,12 @@ export default function App() {
                   {t.radarHeading}
                   {renderHelpButton('heading')}
                 </label>
-                <input type="number" className="config-input" value={selectedRadar.heading} onChange={(e) => updateRadarConfig('heading', e.target.value)} />
+                <input type="number" disabled={selectedRadar.gpsMode && selectedRadar.gpsMode !== 'manual'} className="config-input" value={selectedRadar.heading} onChange={(e) => updateRadarConfig('heading', e.target.value)} />
+                {selectedRadar.gpsMode && selectedRadar.gpsMode !== 'manual' && (
+                  <span style={{ fontSize: '0.75rem', color: 'var(--accent-cyan)', marginTop: '2px' }}>
+                    {lang === 'he' ? '* כיוון מנוהל אוטומטית' : '* Heading is automatically managed'}
+                  </span>
+                )}
               </div>
               {renderHelpText('heading')}
 
@@ -3383,6 +3567,125 @@ export default function App() {
                 </div>
               </div>
               {renderHelpText('useImu')}
+
+              {/* SECTION: GPS & AUTO ALIGNMENT */}
+              <div style={{ gridColumn: 'span 2', borderBottom: '1px solid rgba(255,255,255,0.15)', paddingBottom: '0.4rem', marginTop: '1rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <Activity size={18} color="var(--accent-cyan)" />
+                  <h4 style={{ margin: 0, color: 'var(--accent-cyan)', fontWeight: 'bold' }}>
+                    {lang === 'he' ? 'חיבור GPS וכיוון אוטומטי (פיקסהוק)' : 'GPS Connection & Auto-Alignment (Pixhawk)'}
+                  </h4>
+                </div>
+                {selectedRadar.gpsMode && selectedRadar.gpsMode !== 'manual' && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <span 
+                      style={{
+                        width: '8px', 
+                        height: '8px', 
+                        borderRadius: '50%',
+                        background: 
+                          gpsStatuses[selectedRadarId] === 'connected'     ? 'var(--accent-cyan)' :
+                          gpsStatuses[selectedRadarId] === 'heading-only'  ? '#ff9800' :
+                          gpsStatuses[selectedRadarId] === 'connecting'    ? 'var(--accent-amber)' :
+                          gpsStatuses[selectedRadarId] === 'error'         ? 'var(--accent-red)' : '#555',
+                        boxShadow: 
+                          gpsStatuses[selectedRadarId] === 'connected'     ? '0 0 8px var(--accent-cyan)' :
+                          gpsStatuses[selectedRadarId] === 'heading-only'  ? '0 0 8px #ff9800' :
+                          gpsStatuses[selectedRadarId] === 'connecting'    ? '0 0 8px var(--accent-amber)' : 'none',
+                        display: 'inline-block'
+                      }}
+                      className={gpsStatuses[selectedRadarId] === 'connecting' || gpsStatuses[selectedRadarId] === 'heading-only' ? 'pulse-opacity' : ''}
+                    />
+                    <span style={{ 
+                      fontSize: '0.8rem', 
+                      fontWeight: 'bold',
+                      color: 
+                        gpsStatuses[selectedRadarId] === 'connected'     ? 'var(--accent-cyan)' :
+                        gpsStatuses[selectedRadarId] === 'heading-only'  ? '#ff9800' :
+                        gpsStatuses[selectedRadarId] === 'connecting'    ? 'var(--accent-amber)' :
+                        gpsStatuses[selectedRadarId] === 'error'         ? 'var(--accent-red)' : 'var(--text-secondary)'
+                    }}>
+                      {gpsStatuses[selectedRadarId] === 'connected'    ? (lang === 'he' ? '🛰 מחובר (GPS Lock)' : '🛰 Connected (GPS Lock)') :
+                       gpsStatuses[selectedRadarId] === 'heading-only' ? (lang === 'he' ? '🧭 כיוון בלבד (ללא GPS)' : '🧭 Heading Only (No GPS)') :
+                       gpsStatuses[selectedRadarId] === 'connecting'   ? (lang === 'he' ? 'מתחבר לפורט...' : 'Connecting...') :
+                       gpsStatuses[selectedRadarId] === 'error'        ? (lang === 'he' ? 'שגיאת חיבור' : 'Connection Error') :
+                       (lang === 'he' ? 'מנותק' : 'Disconnected')}
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              {/* GPS Mode */}
+              <div className="flex-col">
+                <label className="text-muted">
+                  {lang === 'he' ? 'מצב GPS' : 'GPS Mode'}
+                </label>
+                <select 
+                  className="config-input"
+                  value={selectedRadar.gpsMode || 'manual'} 
+                  onChange={(e) => updateRadarConfig('gpsMode', e.target.value)}
+                >
+                  <option value="manual">{lang === 'he' ? 'ידני' : 'Manual'}</option>
+                  <option value="auto-stationary">{lang === 'he' ? 'אוטומטי נייח' : 'Auto Stationary'}</option>
+                  <option value="auto-mobile">{lang === 'he' ? 'אוטומטי בתנועה' : 'Auto Mobile'}</option>
+                </select>
+              </div>
+
+              <div className="flex-col">
+                <label className="text-muted">
+                  {lang === 'he' ? 'יציאה טורית (COM Port)' : 'Serial Port'}
+                </label>
+                <select 
+                  className="config-input" 
+                  value={selectedRadar.gpsSerialPort || ''} 
+                  onChange={(e) => updateRadarConfig('gpsSerialPort', e.target.value)} 
+                  disabled={selectedRadar.gpsMode === 'manual' || !selectedRadar.gpsMode}
+                >
+                  <option value="">{lang === 'he' ? '-- בחר יציאה --' : '-- Select Port --'}</option>
+                  {selectedRadar.gpsSerialPort && !availablePorts.includes(selectedRadar.gpsSerialPort) && (
+                    <option key={selectedRadar.gpsSerialPort} value={selectedRadar.gpsSerialPort}>
+                      {selectedRadar.gpsSerialPort} ({lang === 'he' ? 'לא מזוהה / מנותק' : 'Not detected / Offline'})
+                    </option>
+                  )}
+                  {availablePorts.map(port => (
+                    <option key={port} value={port}>{port}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Baud Rate */}
+              <div className="flex-col">
+                <label className="text-muted">
+                  {lang === 'he' ? 'קצב באוד (Baud Rate)' : 'Baud Rate'}
+                </label>
+                <select
+                  className="config-input"
+                  value={selectedRadar.gpsBaudRate || 115200}
+                  onChange={(e) => updateRadarConfig('gpsBaudRate', e.target.value)}
+                  disabled={selectedRadar.gpsMode === 'manual' || !selectedRadar.gpsMode}
+                >
+                  <option value={9600}>9600</option>
+                  <option value={19200}>19200</option>
+                  <option value={38400}>38400</option>
+                  <option value={57600}>57600</option>
+                  <option value={115200}>115200</option>
+                </select>
+              </div>
+
+              {/* Relative Yaw */}
+              <div className="flex-col">
+                <label className="text-muted">
+                  {lang === 'he' ? 'סטיית כיוון יחסית (Yaw Offset)' : 'Relative Yaw Offset'}
+                </label>
+                <input 
+                  type="number" 
+                  className="config-input" 
+                  value={selectedRadar.relativeYaw ?? 0} 
+                  onChange={(e) => updateRadarConfig('relativeYaw', e.target.value)} 
+                  placeholder="0°"
+                  disabled={selectedRadar.gpsMode === 'manual' || !selectedRadar.gpsMode}
+                />
+              </div>
 
               {/* SECTION 3: DETECTION FILTERS */}
               <div style={{ gridColumn: 'span 2', borderBottom: '1px solid rgba(255,255,255,0.15)', paddingBottom: '0.4rem', marginTop: '1rem', display: 'flex', alignItems: 'center', gap: '8px' }}>
