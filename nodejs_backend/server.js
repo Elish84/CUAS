@@ -400,6 +400,7 @@ let fusionConfig = {
   kalmanQ: 1e-7,             // process noise variance (lower = smoother, slower to adapt)
   kalmanR: 1e-5,             // measurement noise variance (increased to handle GPS jitter and prevent velocity spikes)
   enableKinematicClassification: false, // Override raw AI with kinematic heuristics?
+  maxAltDiffM: 50,           // max altitude difference (meters) if altitude is available
 };
 
 function createFusionEngine() {
@@ -600,6 +601,12 @@ function createFusionEngine() {
         const passesFallback = (distToLastKnown <= cfg.maxAssocDistM);
 
         if (!passesKinematic && !passesFallback) continue;
+        
+        // Altitude check (only if both track and detection have reliable altitude)
+        if (cfg.maxAltDiffM !== undefined && detection.alt && track.alt) {
+          const altDiff = Math.abs(detection.alt - track.alt);
+          if (altDiff > cfg.maxAltDiffM) continue;
+        }
         
         // Stricter absolute distance check: Never associate if the absolute jump is completely unrealistic,
         // even if the predicted point matched (which can happen with long maxAssocTimeSec and high speeds).
@@ -871,7 +878,7 @@ app.post('/api/fusion/config', (req, res) => {
     'maxAssocDistM', 'maxAssocTimeSec', 'minDetectionsToConfirm',
     'classificationFusionMode', 'crossRadarFusion',
     'maxHeadingDiffDeg', 'maxSpeedRatioFactor', 'wPosition', 'wVelocity',
-    'kalmanQ', 'kalmanR'
+    'kalmanQ', 'kalmanR', 'maxAltDiffM'
   ];
   allowed.forEach(key => {
     if (req.body[key] !== undefined) {
@@ -1000,6 +1007,17 @@ function spawnDaemon(radar) {
           const r = msg.rest !== undefined ? msg.rest : Math.sqrt(msg.x*msg.x + msg.y*msg.y + msg.z*msg.z);
           const azRel = msg.azest !== undefined ? (msg.azest * Math.PI / 180) : ((msg.x === 0 && msg.z === 0) ? 0 : Math.atan2(msg.x, msg.z));
           const elRel = msg.elest !== undefined ? (msg.elest * Math.PI / 180) : (r === 0 ? 0 : Math.asin(msg.y / r));
+
+          // Soft filter detections that fall outside configured FOV relative bounds
+          const relAzDeg = azRel * (180 / Math.PI);
+          const relElDeg = elRel * (180 / Math.PI);
+          const azMin = radarConfig.azFovMin ?? -60;
+          const azMax = radarConfig.azFovMax ?? 60;
+          const elMin = radarConfig.elFovMin ?? -40;
+          const elMax = radarConfig.elFovMax ?? 40;
+          if (relAzDeg < azMin || relAzDeg > azMax || relElDeg < elMin || relElDeg > elMax) {
+            return;
+          }
 
           // 3D Rotation Matrix compensation:
           // X is Right, Y is Up, Z is Forward

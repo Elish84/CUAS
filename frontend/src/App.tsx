@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import Map, { Source, Layer, Marker, NavigationControl } from 'react-map-gl/maplibre';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { Power, Crosshair, MapPin, Activity, Settings, Radar, Sliders, Wifi, WifiOff, Filter, List, Focus, Trash2, ShieldAlert, Check, Play, Pause, Square, Circle, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Power, Crosshair, MapPin, Activity, Settings, Radar, Sliders, Wifi, WifiOff, Filter, List, Focus, Trash2, ShieldAlert, Check, Play, Pause, Square, Circle, ChevronLeft, ChevronRight, Download, Upload } from 'lucide-react';
 import * as turf from '@turf/turf';
 import './index.css';
 
@@ -163,15 +163,22 @@ function bearingToZone(lng: number, lat: number, zone: DefenseZone): number {
   return turf.bearing(pt, turf.point(nearestPt));
 }
 
+// Global cache for threat scores to avoid recalculating heavy distance geometries multiple times per frame
+export const threatScoreCache = new globalThis.Map<string, { score: number; sClass: number; sProx: number; sEta: number; distM: number; etaSec: number }>();
+
 /**
  * Main threat score computation.
  * Returns a score in [0, 1] and the three sub-scores.
  */
 function computeThreatScore(
-  d: { lng: number; lat: number; speed: number; heading: number; probUAV?: number; classification: string },
+  d: { id?: string; lng: number; lat: number; speed: number; heading: number; probUAV?: number; classification: string },
   defenseZones: DefenseZone[],
   w: ThreatWeights
 ): { score: number; sClass: number; sProx: number; sEta: number; distM: number; etaSec: number } {
+  // Use a string cache key including target coordinates and movement characteristics
+  const cacheKey = `${d.id || ''}_${d.lat.toFixed(5)}_${d.lng.toFixed(5)}_${d.speed.toFixed(1)}_${d.heading.toFixed(1)}_${d.probUAV ?? ''}_${d.classification}`;
+  const cached = threatScoreCache.get(cacheKey);
+  if (cached) return cached;
 
   // ── S_class ─────────────────────────────────────────────
   let sClass: number;
@@ -224,7 +231,18 @@ function computeThreatScore(
     ? (w.wClass * sClass + w.wProx * sProx + w.wEta * sEta) / wTotal
     : 0;
 
-  return { score, sClass, sProx, sEta, distM: distM === Infinity ? -1 : distM, etaSec: etaSec === Infinity ? -1 : etaSec };
+  const result = { score, sClass, sProx, sEta, distM: distM === Infinity ? -1 : distM, etaSec: etaSec === Infinity ? -1 : etaSec };
+  
+  // Cache the computed result
+  threatScoreCache.set(cacheKey, result);
+  
+  // Limit cache size to avoid memory growth
+  if (threatScoreCache.size > 2000) {
+    const firstKey = threatScoreCache.keys().next().value;
+    if (firstKey) threatScoreCache.delete(firstKey);
+  }
+
+  return result;
 }
 
 /**
@@ -523,6 +541,7 @@ export default function App() {
     modeBoth:       lang === 'he' ? 'גילויים + Tracks' : 'Both Detections & Tracks',
     fusionParamsLabel: lang === 'he' ? 'פרמטרי קורלציה' : 'Correlation Parameters',
     maxDistLabel:   lang === 'he' ? 'מרחק gate מקסימלי (מ\')' : 'Max Position Gate (m)',
+    maxAltDiffLabel: lang === 'he' ? 'הפרש גובה מקסימלי (מ\')' : 'Max Altitude Diff (m)',
     maxTimeLabel:   lang === 'he' ? 'זמן מקסימלי ללא עדכון (שנ\')' : 'Max Stale Time (sec)',
     minConfirmLabel: lang === 'he' ? 'גילויים מינ\' לאישור Track' : 'Min Detections to Confirm',
     maxHeadingLabel: lang === 'he' ? 'gate כיוון מקסימלי (מעלות)' : 'Max Heading Gate (deg)',
@@ -738,6 +757,8 @@ export default function App() {
   // Refs for callbacks
   const radarsRef = useRef(radars);
   useEffect(() => { radarsRef.current = radars; }, [radars]);
+  const selectedRadarIdRef = useRef(selectedRadarId);
+  useEffect(() => { selectedRadarIdRef.current = selectedRadarId; }, [selectedRadarId]);
   const filterOutsideFovRef = useRef(filterOutsideFov);
   useEffect(() => { filterOutsideFovRef.current = filterOutsideFov; }, [filterOutsideFov]);
 
@@ -805,6 +826,7 @@ export default function App() {
   // Playback & Recording State
   const [playbackPackets, setPlaybackPackets] = useState<any[]>([]);
   const [playbackTime, setPlaybackTime] = useState<number>(0);
+  const [playbackRenderTime, setPlaybackRenderTime] = useState<number>(0);
   const [playbackDuration, setPlaybackDuration] = useState<number>(0);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(1);
@@ -853,6 +875,11 @@ export default function App() {
     localStorage.setItem('mitzpe_metzoda_radars', JSON.stringify(radars));
   }, [radars]);
 
+  // Clear threat score cache when zones or weights change to force recalculation of geometries
+  useEffect(() => {
+    threatScoreCache.clear();
+  }, [defenseZones, threatWeights]);
+
   useEffect(() => {
     localStorage.setItem('mitzpe_metzoda_uav_threshold', uavThreshold.toString());
   }, [uavThreshold]);
@@ -883,7 +910,9 @@ export default function App() {
     setTrackHistory({});
     setSelectedDetection(null);
     setIsPlaying(false);
+    playbackTimeRef.current = 0;
     setPlaybackTime(0);
+    setPlaybackRenderTime(0);
   }, [appMode]);
 
   useEffect(() => {
@@ -1021,8 +1050,12 @@ export default function App() {
         newTracks.forEach(t => {
           const existing = next[t.id] || [];
           const lastPoint = existing[existing.length - 1];
-          if (!lastPoint || lastPoint.pos[0] !== t.lng || lastPoint.pos[1] !== t.lat) {
-            next[t.id] = [...existing, { pos: [t.lng, t.lat] as [number, number], time: now }].filter(p => p.time > cutoff);
+          const hasMoved = !lastPoint || 
+            Math.abs(lastPoint.pos[0] - t.lng) > 0.00005 || 
+            Math.abs(lastPoint.pos[1] - t.lat) > 0.00005;
+          if (hasMoved) {
+            const nextPoints = [...existing.filter(p => p.time > cutoff), { pos: [t.lng, t.lat] as [number, number], time: now }];
+            next[t.id] = nextPoints.slice(-150);
           } else {
             next[t.id] = existing.filter(p => p.time > cutoff);
           }
@@ -1044,8 +1077,12 @@ export default function App() {
         newDets.forEach(d => {
           const existing = next[d.id] || [];
           const lastPoint = existing[existing.length - 1];
-          if (!lastPoint || lastPoint.pos[0] !== d.lng || lastPoint.pos[1] !== d.lat) {
-            next[d.id] = [...existing, { pos: [d.lng, d.lat] as [number, number], time: now }].filter(p => p.time > cutoff);
+          const hasMoved = !lastPoint || 
+            Math.abs(lastPoint.pos[0] - d.lng) > 0.00005 || 
+            Math.abs(lastPoint.pos[1] - d.lat) > 0.00005;
+          if (hasMoved) {
+            const nextPoints = [...existing.filter(p => p.time > cutoff), { pos: [d.lng, d.lat] as [number, number], time: now }];
+            next[d.id] = nextPoints.slice(-150);
           } else {
             next[d.id] = existing.filter(p => p.time > cutoff);
           }
@@ -1219,6 +1256,62 @@ export default function App() {
     }
   };
 
+  const exportConfig = () => {
+    const config = {
+      radars,
+      displayMode,
+      ignoreZones,
+      defenseZones,
+      threatWeights,
+      alertThreshold,
+      alertSoundType,
+      alertPopupDuration,
+      filterOutsideFov,
+      maxRecordingDuration,
+      mapType,
+      filters,
+      appMode,
+      uavThreshold,
+      isDebugMode
+    };
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(config, null, 2));
+    const dlAnchorElem = document.createElement('a');
+    dlAnchorElem.setAttribute("href", dataStr);
+    dlAnchorElem.setAttribute("download", `mitzpe_metzoda_config_${new Date().toISOString().slice(0,10)}.json`);
+    dlAnchorElem.click();
+  };
+
+  const importConfig = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const config = JSON.parse(e.target?.result as string);
+        if (config.radars) setRadars(config.radars);
+        if (config.displayMode) setDisplayMode(config.displayMode);
+        if (config.ignoreZones) setIgnoreZones(config.ignoreZones);
+        if (config.defenseZones) setDefenseZones(config.defenseZones);
+        if (config.threatWeights) setThreatWeights(config.threatWeights);
+        if (config.alertThreshold !== undefined) setAlertThreshold(config.alertThreshold);
+        if (config.alertSoundType) setAlertSoundType(config.alertSoundType);
+        if (config.alertPopupDuration !== undefined) setAlertPopupDuration(config.alertPopupDuration);
+        if (config.filterOutsideFov !== undefined) setFilterOutsideFov(config.filterOutsideFov);
+        if (config.maxRecordingDuration !== undefined) setMaxRecordingDuration(config.maxRecordingDuration);
+        if (config.mapType) setMapType(config.mapType);
+        if (config.filters) setFilters(config.filters);
+        if (config.appMode) setAppMode(config.appMode);
+        if (config.uavThreshold !== undefined) setUavThreshold(config.uavThreshold);
+        if (config.isDebugMode !== undefined) setIsDebugMode(config.isDebugMode);
+        alert(lang === 'he' ? 'הגדרות נטענו בהצלחה!' : 'Configuration loaded successfully!');
+      } catch (err) {
+        alert(lang === 'he' ? 'שגיאה בקריאת קובץ ההגדרות' : 'Error reading configuration file');
+      }
+    };
+    reader.readAsText(file);
+    event.target.value = '';
+  };
+
   const fetchRecordingsList = async () => {
     try {
       const response = await fetch('/api/recordings');
@@ -1240,7 +1333,9 @@ export default function App() {
         if (selectedPlaybackFile === filename) {
           setSelectedPlaybackFile('');
           setPlaybackPackets([]);
+          playbackTimeRef.current = 0;
           setPlaybackTime(0);
+          setPlaybackRenderTime(0);
           setPlaybackDuration(0);
           setIsPlaying(false);
           setDetections([]);
@@ -1265,12 +1360,15 @@ export default function App() {
     if (appMode === 'playback') return;
     const interval = setInterval(() => {
       const now = Date.now();
+      const currentRadars = radarsRef.current;
+      const currentSelectedRadar = currentRadars.find(r => r.id === selectedRadarIdRef.current) || currentRadars[0];
+
       setDetections(prev => {
         const kept: Detection[] = [];
         const removedIds: string[] = [];
         
         for (const d of prev) {
-          const sourceRadar = radars.find(r => r.id === d.radarId) || selectedRadar;
+          const sourceRadar = currentRadars.find(r => r.id === d.radarId) || currentSelectedRadar;
           const thresholdMs = sourceRadar.fadeThreshold * 1000;
           if ((now - d.lastUpdated) < thresholdMs) {
             kept.push(d);
@@ -1286,11 +1384,14 @@ export default function App() {
             removedIds.forEach(id => { delete updated[id]; });
             return updated;
           });
+          setSelectedDetection(currentSelected => {
+            if (currentSelected && removedIds.includes(currentSelected.id)) {
+              return null;
+            }
+            return currentSelected;
+          });
         }
         
-        if (selectedDetection && removedIds.includes(selectedDetection.id)) {
-          setSelectedDetection(null);
-        }
         return kept;
       });
 
@@ -1301,8 +1402,8 @@ export default function App() {
         for (const tr of prev) {
           // Use the longest fade threshold among all contributing radars
           const maxFade = Math.max(...(tr.radarIds || []).map(rid => {
-            const r = radars.find(x => x.id === rid);
-            return r ? r.fadeThreshold : selectedRadar.fadeThreshold;
+            const r = currentRadars.find(x => x.id === rid);
+            return r ? r.fadeThreshold : currentSelectedRadar.fadeThreshold;
           })) * 1000;
           if ((now - tr.lastUpdated) < maxFade) {
             kept.push(tr);
@@ -1316,15 +1417,18 @@ export default function App() {
             removedIds.forEach(id => { delete updated[id]; });
             return updated;
           });
-          if (selectedDetection && removedIds.includes(selectedDetection.id)) {
-            setSelectedDetection(null);
-          }
+          setSelectedDetection(currentSelected => {
+            if (currentSelected && removedIds.includes(currentSelected.id)) {
+              return null;
+            }
+            return currentSelected;
+          });
         }
         return kept;
       });
     }, 1000);
     return () => clearInterval(interval);
-  }, [radars, selectedDetection, selectedRadar]);
+  }, [appMode]);
 
   // Simulation Loop - persistent tracks with realistic drone/bird movement
   useEffect(() => {
@@ -1488,10 +1592,11 @@ export default function App() {
     const targetRadar = radars.find(r => r.id === id);
     if (!targetRadar) return;
     const newState = !targetRadar.isActive;
-    setRadars(radars.map(r => r.id === id ? { ...r, isActive: newState } : r));
+    const updatedRadars = radars.map(r => r.id === id ? { ...r, isActive: newState } : r);
+    setRadars(updatedRadars);
     if (!isSimulationMode && wsRef.current?.readyState === WebSocket.OPEN) {
       // Always send fresh configure first so server has updated radar config
-      wsRef.current.send(JSON.stringify({ action: 'configure', radars }));
+      wsRef.current.send(JSON.stringify({ action: 'configure', radars: updatedRadars }));
       wsRef.current.send(JSON.stringify({ action: newState ? 'turnOn' : 'turnOff', radarId: id }));
       // Immediately show 'connecting' or 'off' in the UI without waiting for server
       if (newState) {
@@ -1504,9 +1609,12 @@ export default function App() {
 
   const handleMasterPower = () => {
     const anyOff = radars.some(r => !r.isActive);
-    setRadars(radars.map(r => ({ ...r, isActive: anyOff })));
+    const updatedRadars = radars.map(r => ({ ...r, isActive: anyOff }));
+    setRadars(updatedRadars);
     if (!isSimulationMode && wsRef.current?.readyState === WebSocket.OPEN) {
-      radars.forEach(r => {
+      // Send configure first so backend has the updated active states
+      wsRef.current.send(JSON.stringify({ action: 'configure', radars: updatedRadars }));
+      updatedRadars.forEach(r => {
         wsRef.current?.send(JSON.stringify({ action: anyOff ? "turnOn" : "turnOff", radarId: r.id }));
       });
     }
@@ -1552,10 +1660,14 @@ export default function App() {
   useEffect(() => {
     if (!selectedPlaybackFile || appMode !== 'playback') {
       setPlaybackPackets([]);
+      playbackTimeRef.current = 0;
       setPlaybackTime(0);
+      setPlaybackRenderTime(0);
       setPlaybackDuration(0);
       setIsPlaying(false);
       setDetections([]);
+      setTrackHistory({});
+      setTrackHistory_fused({});
       return;
     }
 
@@ -1570,13 +1682,21 @@ export default function App() {
         if (parsed.length > 0) {
           const maxTime = parsed[parsed.length - 1].timestamp;
           setPlaybackDuration(maxTime);
+          playbackTimeRef.current = 0;
           setPlaybackTime(0);
+          setPlaybackRenderTime(0);
           setIsPlaying(false);
           setDetections([]);
+          setTrackHistory({});
+          setTrackHistory_fused({});
         } else {
           setPlaybackDuration(0);
+          playbackTimeRef.current = 0;
           setPlaybackTime(0);
+          setPlaybackRenderTime(0);
           setIsPlaying(false);
+          setTrackHistory({});
+          setTrackHistory_fused({});
           alert(lang === 'he' ? 'קובץ ההקלטה ריק' : 'Recording file is empty');
         }
       } catch (e: any) {
@@ -1602,6 +1722,9 @@ export default function App() {
 
   const playbackPacketsRef = useRef(playbackPackets);
   useEffect(() => { playbackPacketsRef.current = playbackPackets; }, [playbackPackets]);
+
+  const lastPlaybackUpdateRef = useRef<number>(0);
+  const lastTrailUpdateRef = useRef<number>(0);
 
   // Main playback tick logic
   const updateDetectionsForTime = useCallback((timeMs: number) => {
@@ -1650,15 +1773,18 @@ export default function App() {
     // Map the relative timestamp to standard Date.now() representation so rendering matches normal logic
     const mappedDets = Object.values(activeDets).map(d => ({
       ...d,
+      originalTimestamp: d.lastUpdated,
       lastUpdated: Date.now() - (timeMs - d.lastUpdated)
     }));
 
     const mappedTracks = Object.values(activeTracks).map(t => ({
       ...t,
+      originalTimestamp: t.lastUpdated,
       lastUpdated: Date.now() - (timeMs - t.lastUpdated)
     }));
 
     const activeTrackIds = new Set(mappedTracks.map(t => t.id));
+    const activeDetIds = new Set(mappedDets.map(d => d.id));
 
     // Single atomic state update — avoids N intermediate renders
     setDetections(mappedDets);
@@ -1669,22 +1795,48 @@ export default function App() {
     });
     setTrackHistory_fused(prev => {
       const next = { ...prev };
+      const currentTime = timeMs;
+      const cutoff = currentTime - 60000;
       // Remove history for expired tracks
       Object.keys(next).forEach(k => {
         if (!activeTrackIds.has(k)) delete next[k];
       });
-      // Append current position for each active track only if it moved
+      // Append current position for each active track only if it moved significantly
       mappedTracks.forEach(t => {
         const existing = next[t.id] || [];
-        const cutoff = Date.now() - 60000;
         const lastPoint = existing[existing.length - 1];
-        if (!lastPoint || lastPoint.pos[0] !== t.lng || lastPoint.pos[1] !== t.lat) {
-          next[t.id] = [
-            ...existing.filter(p => p.time > cutoff),
-            { pos: [t.lng, t.lat] as [number, number], time: Date.now() }
-          ];
+        const hasMoved = !lastPoint || 
+          Math.abs(lastPoint.pos[0] - t.lng) > 0.00005 || 
+          Math.abs(lastPoint.pos[1] - t.lat) > 0.00005;
+        if (hasMoved) {
+          const nextPoints = [...existing.filter(p => p.time > cutoff), { pos: [t.lng, t.lat] as [number, number], time: (t as any).originalTimestamp }];
+          next[t.id] = nextPoints.slice(-150);
         } else {
           next[t.id] = existing.filter(p => p.time > cutoff);
+        }
+      });
+      return next;
+    });
+    setTrackHistory(prev => {
+      const next = { ...prev };
+      const currentTime = timeMs;
+      const cutoff = currentTime - 60000;
+      // Remove history for expired detections
+      Object.keys(next).forEach(k => {
+        if (!activeDetIds.has(k)) delete next[k];
+      });
+      // Append current position for each active detection only if it moved significantly
+      mappedDets.forEach(d => {
+        const existing = next[d.id] || [];
+        const lastPoint = existing[existing.length - 1];
+        const hasMoved = !lastPoint || 
+          Math.abs(lastPoint.pos[0] - d.lng) > 0.00005 || 
+          Math.abs(lastPoint.pos[1] - d.lat) > 0.00005;
+        if (hasMoved) {
+          const nextPoints = [...existing.filter(p => p.time > cutoff), { pos: [d.lng, d.lat] as [number, number], time: (d as any).originalTimestamp }];
+          next[d.id] = nextPoints.slice(-150);
+        } else {
+          next[d.id] = existing.filter(p => p.time > cutoff);
         }
       });
       return next;
@@ -1700,12 +1852,28 @@ export default function App() {
     setLiveImuData(imuData);
   }, [selectedRadar.fadeThreshold]);
 
+  const updateDetectionsForTimeRef = useRef(updateDetectionsForTime);
   useEffect(() => {
-    if (appMode !== 'playback') return;
-    if (!isPlaying) return;
+    updateDetectionsForTimeRef.current = updateDetectionsForTime;
+  }, [updateDetectionsForTime]);
+
+  const playbackFrameIdRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (appMode !== 'playback' || !isPlaying) {
+      if (playbackFrameIdRef.current !== null) {
+        cancelAnimationFrame(playbackFrameIdRef.current);
+        playbackFrameIdRef.current = null;
+      }
+      return;
+    }
+
+    // Cancel any existing loop just in case
+    if (playbackFrameIdRef.current !== null) {
+      cancelAnimationFrame(playbackFrameIdRef.current);
+    }
 
     let lastRealTime = performance.now();
-    let frameId: number;
 
     const tick = () => {
       const now = performance.now();
@@ -1718,21 +1886,44 @@ export default function App() {
         setIsPlaying(false);
       }
 
-      setPlaybackTime(nextTime);
-      updateDetectionsForTime(nextTime);
+      playbackTimeRef.current = nextTime;
+
+      // Throttle primary UI/map updates to ~10 FPS (every 100ms)
+      const nowMs = performance.now();
+      if (nowMs - lastPlaybackUpdateRef.current >= 100 || nextTime >= playbackDurationRef.current) {
+        setPlaybackTime(nextTime);
+        updateDetectionsForTimeRef.current(nextTime);
+        
+        // Heavy trails GeoJSON calculation (playbackRenderTime) is throttled to 2 FPS (every 500ms)
+        if (nowMs - lastTrailUpdateRef.current >= 500 || nextTime >= playbackDurationRef.current) {
+          setPlaybackRenderTime(nextTime);
+          lastTrailUpdateRef.current = nowMs;
+        }
+        
+        lastPlaybackUpdateRef.current = nowMs;
+      }
 
       if (nextTime < playbackDurationRef.current && isPlayingRef.current) {
-        frameId = requestAnimationFrame(tick);
+        playbackFrameIdRef.current = requestAnimationFrame(tick);
+      } else {
+        playbackFrameIdRef.current = null;
       }
     };
 
-    frameId = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(frameId);
-  }, [appMode, isPlaying, updateDetectionsForTime]);
+    playbackFrameIdRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (playbackFrameIdRef.current !== null) {
+        cancelAnimationFrame(playbackFrameIdRef.current);
+        playbackFrameIdRef.current = null;
+      }
+    };
+  }, [appMode, isPlaying]);
 
   const handleSeek = (timeMs: number) => {
+    playbackTimeRef.current = timeMs;
     setPlaybackTime(timeMs);
     updateDetectionsForTime(timeMs);
+    setPlaybackRenderTime(timeMs);
   };
 
 
@@ -1949,7 +2140,7 @@ export default function App() {
     currentThreats.forEach(t => {
       if (!focusedThreatIdsRef.current.has(t.id)) {
         setSelectedDetection(t);
-        if (mapRef.current) {
+        if (mapRef.current && appMode !== 'playback') {
           mapRef.current.flyTo({ center: [t.lng, t.lat], zoom: 15, duration: 1000 });
         }
         focusedThreatIdsRef.current.add(t.id);
@@ -2050,7 +2241,8 @@ export default function App() {
 
   const trailsGeoJson = useMemo(() => {
     const features: any[] = [];
-    const cutoff = Date.now() - (filters.trailLengthSeconds * 1000);
+    const currentTime = appMode === 'playback' ? playbackRenderTime : Date.now();
+    const cutoff = currentTime - (filters.trailLengthSeconds * 1000);
     
     if (displayMode !== 'tracks') {
       filteredDetections.forEach(d => {
@@ -2078,7 +2270,7 @@ export default function App() {
     
     if (features.length === 0) return null;
     return turf.featureCollection(features);
-  }, [displayMode, filteredDetections, filteredTracks, trackHistory, trackHistory_fused, filters.trailLengthSeconds]);
+  }, [displayMode, filteredDetections, filteredTracks, trackHistory, trackHistory_fused, filters.trailLengthSeconds, appMode, playbackRenderTime]);
 
   // Dynamic Map Style based on user choice
   const mapStyleMemo = useMemo(() => {
@@ -3767,6 +3959,16 @@ export default function App() {
               <button onClick={() => setShowAdminModal(false)} style={{ background: 'transparent', border: 'none', color: '#fff', cursor: 'pointer', fontSize: '1.8rem' }}>&times;</button>
             </div>
 
+            <div className="flex-row" style={{ gap: '1rem', borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: '1rem' }}>
+              <button className="glowing-btn" onClick={exportConfig} style={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '8px' }}>
+                <Download size={18} /> {lang === 'he' ? 'שמור הגדרות לקובץ' : 'Export Config'}
+              </button>
+              <label className="glowing-btn active" style={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                <Upload size={18} /> {lang === 'he' ? 'טען הגדרות מקובץ' : 'Import Config'}
+                <input type="file" accept=".json" style={{ display: 'none' }} onChange={importConfig} />
+              </label>
+            </div>
+
             <div className="flex-col" style={{ padding: '0 0 1rem 0', borderBottom: '1px solid rgba(255,255,255,0.1)', gap: '1rem' }}>
               <div className="flex-row" style={{ gap: '2rem' }}>
                 <label style={{ display: 'flex', alignItems: 'center', gap: '10px', color: '#fff', cursor: 'pointer' }}>
@@ -4011,6 +4213,7 @@ export default function App() {
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
                   {([
                     { key: 'maxAssocDistM',       label: t.maxDistLabel,        type: 'number', min: 10,  max: 1000 },
+                    { key: 'maxAltDiffM',         label: t.maxAltDiffLabel,     type: 'number', min: 10,  max: 500 },
                     { key: 'maxAssocTimeSec',     label: t.maxTimeLabel,        type: 'number', min: 1,   max: 60 },
                     { key: 'minDetectionsToConfirm', label: t.minConfirmLabel, type: 'number', min: 1,   max: 10 },
                     { key: 'maxHeadingDiffDeg',   label: t.maxHeadingLabel,     type: 'number', min: 10,  max: 180 },
